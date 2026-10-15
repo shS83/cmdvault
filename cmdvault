@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Find and keep useful commands from your own Bash history."""
+
+import argparse
+from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+VERSION = "0.1.0"
+
+
+@dataclass
+class Entry:
+    command: str
+    count: int = 0
+    recent: int = -1
+    favorite: bool = False
+
+
+def history_commands(text):
+    """Timestamped Bash entries preserve literal multiline commands."""
+    pending = None
+    for line in text.splitlines():
+        if re.fullmatch(r"#[0-9]+", line):
+            if pending is not None:
+                command = "\n".join(pending)
+                if command.strip():
+                    yield command
+            pending = []
+        elif pending is not None:
+            pending.append(line)
+        elif line.strip():
+            yield line
+    if pending is not None:
+        command = "\n".join(pending)
+        if command.strip():
+            yield command
+
+
+def favorites_path():
+    root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    return root / "cmdvault/favorites.json"
+
+
+def read_favorites(path):
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list) or any(
+        not isinstance(command, str) or not command.strip() or "\0" in command
+        for command in data
+    ):
+        raise ValueError(f"Invalid favorites file: {path}")
+    return list(dict.fromkeys(data))
+
+
+def update_favorite(path, command, remove=False):
+    if not command.strip() or "\0" in command:
+        raise ValueError("A command must be nonempty and contain no NUL characters.")
+    # Lock a separate file because the JSON file is atomically replaced.
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(lock_fd, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        commands = read_favorites(path)
+        if remove:
+            commands = [item for item in commands if item != command]
+        elif command not in commands:
+            commands.append(command)
+        fd, temporary = tempfile.mkstemp(prefix=".favorites-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                json.dump(commands, output, ensure_ascii=False, indent=2)
+                output.write("\n")
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def entries_from(history, favorites):
+    entries = {}
+    for index, command in enumerate(history_commands(history)):
+        if "\0" in command:
+            continue
+        entry = entries.setdefault(command, Entry(command))
+        entry.count += 1
+        entry.recent = index
+    for command in favorites:
+        entries.setdefault(command, Entry(command)).favorite = True
+    return sorted(entries.values(), key=lambda entry: (entry.favorite, entry.recent), reverse=True)
+
+
+def display(command):
+    # Escape control characters in the picker without changing the saved command.
+    return json.dumps(command, ensure_ascii=False)[1:-1]
+
+
+def pick(entries, query, favorites_only):
+    fzf = shutil.which("fzf")
+    if not fzf:
+        raise ValueError("fzf is required for the picker. Install it or use --list.")
+    rows = "".join(
+        f"{index}\t{'★' if entry.favorite else '·'}  {entry.count:>4}x  {display(entry.command)}\n"
+        for index, entry in enumerate(entries)
+    )
+    env = os.environ.copy()
+    # Personal fzf bindings must not reinterpret history rows as shell commands.
+    env.pop("FZF_DEFAULT_OPTS", None)
+    env.pop("FZF_DEFAULT_OPTS_FILE", None)
+    result = subprocess.run(
+        [fzf, "--delimiter=\t", "--with-nth=2..", "--no-multi", "--layout=reverse",
+         "--height=90%", "--border=rounded", "--prompt=vault › ",
+         "--border-label= CMDVAULT / " + ("FAVORITES " if favorites_only else "HISTORY "),
+         "--header=ENTER print · CTRL-S favorite · CTRL-Y copy · ESC cancel",
+         "--expect=ctrl-s,ctrl-y", "--query=" + query],
+        input=rows, capture_output=True, text=True, env=env,
+    )
+    if result.returncode in (1, 130):
+        return None
+    if result.returncode:
+        raise ValueError("fzf failed: " + result.stderr.strip())
+    lines = result.stdout.splitlines()
+    if len(lines) != 2 or lines[0] not in ("", "ctrl-s", "ctrl-y"):
+        raise ValueError("Invalid picker output.")
+    try:
+        index = int(lines[1].split("\t", 1)[0])
+        if not 0 <= index < len(entries):
+            raise ValueError
+    except ValueError:
+        raise ValueError("Invalid picker selection.") from None
+    return lines[0], entries[index].command
+
+
+def copy_command(command, functions_file=None, terminal="/dev/tty"):
+    functions_file = functions_file or Path.home() / ".functions"
+    if not Path(functions_file).is_file():
+        raise ValueError(f"Copy function file not found: {functions_file}")
+    try:
+        with open(terminal, "w", encoding="utf-8") as output:
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-c",
+                 'source "$1" || exit; declare -F copy >/dev/null || exit 127; copy',
+                 "cmdvault-copy", str(functions_file)],
+                input=command, text=True, stdout=output, stderr=subprocess.PIPE,
+            )
+    except OSError as error:
+        raise ValueError(f"Cannot access the terminal for copy(): {error}") from error
+    if result.returncode:
+        raise ValueError("copy() failed: " + (result.stderr.strip() or "check ~/.functions"))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("query", nargs="*", help="initial fzf search; substring filter with --list")
+    parser.add_argument("--version", action="version", version=f"cmdvault {VERSION}")
+    parser.add_argument("--history", type=Path,
+                        default=Path(os.environ.get("HISTFILE") or Path.home() / ".bash_history"),
+                        help="Bash history file (default: HISTFILE or ~/.bash_history)")
+    parser.add_argument("--favorites", action="store_true", help="show only saved commands")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--list", action="store_true", help="print commands without fzf")
+    actions.add_argument("--copy", action="store_true", help="copy the selected command")
+    actions.add_argument("--add", metavar="COMMAND", help="save an exact command as a favorite")
+    actions.add_argument("--remove", metavar="COMMAND", help="remove an exact favorite")
+    args = parser.parse_args(argv)
+    if (args.add is not None or args.remove is not None) and args.query:
+        parser.error("--add and --remove take one quoted command, without search terms")
+    path = favorites_path()
+    if args.add is not None or args.remove is not None:
+        update_favorite(path, args.add if args.add is not None else args.remove,
+                        remove=args.remove is not None)
+        print("cmdvault: Favorite " + ("removed." if args.remove is not None else "saved."), file=sys.stderr)
+        return 0
+    favorites = read_favorites(path)
+    history = ""
+    if not args.favorites:
+        try:
+            history = args.history.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            print(f"cmdvault: History file not found: {args.history}", file=sys.stderr)
+    entries = entries_from(history, favorites)
+    query = " ".join(args.query)
+    if args.list:
+        for entry in entries:
+            if query.casefold() in entry.command.casefold():
+                print(entry.command)
+        return 0
+    if not entries:
+        print("cmdvault: No commands found. Save shell history with history -a, or add a favorite.", file=sys.stderr)
+        return 1
+    selected = pick(entries, query, args.favorites)
+    if selected is None:
+        return 1
+    key, command = selected
+    if key == "ctrl-s":
+        update_favorite(path, command)
+        print("cmdvault: Favorite saved.", file=sys.stderr)
+    if key == "ctrl-y" or args.copy:
+        try:
+            copy_command(command)
+        except ValueError:
+            print(command)
+            raise
+        print("cmdvault: Sent to copy().", file=sys.stderr)
+    else:
+        print(command)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError) as error:
+        print(f"cmdvault: {error}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
