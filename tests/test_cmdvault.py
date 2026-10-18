@@ -96,7 +96,7 @@ class VaultTests(unittest.TestCase):
             "rows = sys.stdin.read().splitlines()\n"
             "print('')\nprint('' if '★' in rows[0] else 'ctrl-s')\nprint(rows[0])\n"
         )
-        result = self.run_cli()
+        result = self.run_cli("--print")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, command + "\n")
         self.assertEqual(json.loads(self.favorite_file.read_text()), [command])
@@ -169,6 +169,32 @@ class PickerRegressionTests(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 self.assertEqual(vault.main(['--favorites','--list']),0)
             self.assertEqual(output.getvalue(),command+'\n')
+
+
+class ExecutionTests(unittest.TestCase):
+    def test_execution_preserves_exact_command_and_terminal(self):
+        command = "printf '%s' 'a b' | cat > output.txt\nprintf done"
+        with patch.object(vault.shutil, 'which', return_value='/usr/bin/bash'), patch.object(vault.os, 'execv') as execute:
+            vault.execute_command(command)
+        execute.assert_called_once_with('/usr/bin/bash', ['/usr/bin/bash', '--noprofile', '-ic', command])
+
+    def test_missing_bash_is_reported(self):
+        with patch.object(vault.shutil, 'which', return_value=None):
+            with self.assertRaisesRegex(ValueError, 'Bash is required'):
+                vault.execute_command('echo test')
+
+    def test_enter_executes_but_copy_print_and_cancel_do_not(self):
+        import contextlib
+        import io
+        for args, selection, should_run, should_copy in [([], ('', 'echo hello'), True, False),
+                (['--print'], ('', 'echo hello'), False, False),
+                (['--copy'], ('', 'echo hello'), False, True),
+                ([], ('ctrl-y', 'echo hello'), False, True), ([], None, False, False)]:
+            with self.subTest(args=args, selection=selection), patch.object(vault, 'read_favorites', return_value=['echo hello']), patch.object(vault, 'pick', return_value=selection), patch.object(vault, 'execute_command') as execute, patch.object(vault, 'copy_command') as copy, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                vault.main(['--favorites', *args])
+                self.assertEqual(execute.called, should_run)
+                self.assertEqual(copy.called, should_copy)
+                if should_run: execute.assert_called_once_with('echo hello')
 
 
 if __name__ == "__main__":
