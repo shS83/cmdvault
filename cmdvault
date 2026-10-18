@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 
 @dataclass
@@ -108,36 +108,54 @@ def pick(entries, query, favorites_only):
     fzf = shutil.which("fzf")
     if not fzf:
         raise ValueError("fzf is required for the picker. Install it or use --list.")
-    rows = "".join(
-        f"{index}\t{'★' if entry.favorite else '·'}  {entry.count:>4}x  {display(entry.command)}\n"
-        for index, entry in enumerate(entries)
-    )
     env = os.environ.copy()
-    # Personal fzf bindings must not reinterpret history rows as shell commands.
     env.pop("FZF_DEFAULT_OPTS", None)
     env.pop("FZF_DEFAULT_OPTS_FILE", None)
-    result = subprocess.run(
-        [fzf, "--delimiter=\t", "--with-nth=2..", "--no-multi", "--layout=reverse",
-         "--height=90%", "--border=rounded", "--prompt=vault › ",
-         "--border-label= CMDVAULT / " + ("FAVORITES " if favorites_only else "HISTORY "),
-         "--header=ENTER print · CTRL-S favorite · CTRL-Y copy · ESC cancel",
-         "--expect=ctrl-s,ctrl-y", "--query=" + query],
-        input=rows, capture_output=True, text=True, env=env,
-    )
-    if result.returncode in (1, 130):
-        return None
-    if result.returncode:
-        raise ValueError("fzf failed: " + result.stderr.strip())
-    lines = result.stdout.splitlines()
-    if len(lines) != 2 or lines[0] not in ("", "ctrl-s", "ctrl-y"):
-        raise ValueError("Invalid picker output.")
-    try:
-        index = int(lines[1].split("\t", 1)[0])
-        if not 0 <= index < len(entries):
-            raise ValueError
-    except ValueError:
-        raise ValueError("Invalid picker selection.") from None
-    return lines[0], entries[index].command
+    position = 1
+    notice = ""
+    while True:
+        rows = "".join(
+            f"{index}\t" + ("\x1b[33m" if entry.favorite else "") +
+            f"{'★' if entry.favorite else '·'}  {entry.count:>4}x  {display(entry.command)}" +
+            ("\x1b[0m" if entry.favorite else "") + "\n"
+            for index, entry in enumerate(entries)
+        )
+        result = subprocess.run(
+            [fzf, "--ansi", "--delimiter=\t", "--with-nth=2..", "--no-multi", "--layout=reverse",
+             "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
+             "--border-label= CMDVAULT / " + ("FAVORITES " if favorites_only else "HISTORY "),
+             "--header=ENTER print · CTRL-S / ALT-F save favorite (stay open) · CTRL-Y copy · ESC cancel" + notice,
+             "--bind=start:pos(" + str(position) + ")",
+             "--expect=ctrl-s,alt-f,ctrl-y", "--query=" + query],
+            input=rows, capture_output=True, text=True, env=env,
+        )
+        if result.returncode in (1, 130):
+            return None
+        if result.returncode:
+            raise ValueError("fzf failed: " + result.stderr.strip())
+        lines = result.stdout.splitlines()
+        if len(lines) != 3 or lines[1] not in ("", "ctrl-s", "alt-f", "ctrl-y"):
+            raise ValueError("Invalid picker output.")
+        query, key, row = lines
+        try:
+            index = int(row.split("\t", 1)[0])
+            if not 0 <= index < len(entries):
+                raise ValueError
+        except ValueError:
+            raise ValueError("Invalid picker selection.") from None
+        if key not in ("ctrl-s", "alt-f"):
+            return key, entries[index].command
+        try:
+            update_favorite(favorites_path(), entries[index].command)
+        except (OSError, ValueError) as error:
+            notice = "\nSave failed: " + display(str(error))
+        else:
+            entries[index].favorite = True
+            notice = "\n★ Favorite saved. Yellow rows are saved favorites."
+        # Keep the selected command near the top without changing its original text.
+        entry = entries.pop(index)
+        entries.insert(0, entry)
+        position = 1
 
 
 def copy_command(command, functions_file=None, terminal="/dev/tty"):
@@ -195,15 +213,12 @@ def main(argv=None):
                 print(entry.command)
         return 0
     if not entries:
-        print("cmdvault: No commands found. Save shell history with history -a, or add a favorite.", file=sys.stderr)
+        print(f"cmdvault: No commands found. Favorites file: {path}. Save with Ctrl-S / Alt-F or --add; Ctrl-Y only copies.", file=sys.stderr)
         return 1
     selected = pick(entries, query, args.favorites)
     if selected is None:
         return 1
     key, command = selected
-    if key == "ctrl-s":
-        update_favorite(path, command)
-        print("cmdvault: Favorite saved.", file=sys.stderr)
     if key == "ctrl-y" or args.copy:
         try:
             copy_command(command)

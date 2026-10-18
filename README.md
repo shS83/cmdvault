@@ -1,4 +1,4 @@
-# cmdvault 0.1.0
+# cmdvault 0.1.1
 
 Find the useful commands buried in your own Bash history. Search with fzf,
 keep favorites, and copy an exact command to the clipboard.
@@ -39,15 +39,17 @@ Inside the picker:
 | Key | Action |
 | --- | --- |
 | Enter | Print the original command and exit |
-| Ctrl-S | Save a favorite, print the command and exit |
+| Ctrl-S / Alt-F | Save a favorite, turn the row yellow and stay in the picker |
 | Ctrl-Y | Copy the original command to the clipboard and exit |
 | Esc | Cancel |
 
-With `--copy`, Enter and Ctrl-S also copy the selection. If the clipboard is
+With `--copy`, Enter copies the selection. Ctrl-S / Alt-F only save; they do not copy or exit. Ctrl-Y only copies; it does not save a favorite. If the clipboard is
 unavailable or `copy()` fails, the command is printed instead and cmdvault exits
 with an error. OSC 52 has no confirmation of clipboard delivery, so a successful
 copy reports that the command was sent to `copy()`.
 Selected commands are never executed. Diagnostic messages go to stderr.
+
+Saved rows are yellow and marked with a star. Saving preserves the search query and returns to the picker; Esc afterwards does not undo the save. Alt-F is available if the terminal intercepts Ctrl-S.
 
 Duplicates are combined, with favorites first and then most recently used
 commands. The `Nx` column counts occurrences in the currently loaded history

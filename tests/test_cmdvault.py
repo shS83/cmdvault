@@ -36,6 +36,7 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(json.loads('"' + rendered + '"'), command)
 
 
+@unittest.skipUnless(os.name == "posix", "Linux integration tests require fcntl, executable scripts and Bash")
 class VaultTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -93,7 +94,7 @@ class VaultTests(unittest.TestCase):
             "import os, sys\n"
             "assert 'FZF_DEFAULT_OPTS' not in os.environ\n"
             "rows = sys.stdin.read().splitlines()\n"
-            "print('ctrl-s')\nprint(rows[0])\n"
+            "print('')\nprint('' if '★' in rows[0] else 'ctrl-s')\nprint(rows[0])\n"
         )
         result = self.run_cli()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -125,6 +126,49 @@ class VaultTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unavailable"):
                 vault.main(["--history", str(self.history)])
             self.assertEqual(output.write.call_args_list[0].args, ("ls",))
+
+
+class PickerRegressionTests(unittest.TestCase):
+    def test_save_stays_open_colors_row_and_preserves_pipeline(self):
+        command = "hcxwltool -i the_list.txt --straight | sort | uniq | hashcat -m 22000 hashfile.hc22000"
+        entry = vault.Entry(command)
+        responses = [subprocess.CompletedProcess([], 0, 'hashcat\nctrl-s\n0\trow\n', ''),
+                     subprocess.CompletedProcess([], 130, '', '')]
+        with patch.object(vault.shutil, 'which', return_value='fzf'), patch.object(vault.subprocess, 'run', side_effect=responses) as run, patch.object(vault, 'update_favorite') as save:
+            self.assertIsNone(vault.pick([entry], '', False))
+        save.assert_called_once_with(vault.favorites_path(), command)
+        self.assertEqual(run.call_count, 2)
+        self.assertIn('\x1b[33m', run.call_args.kwargs['input'])
+        self.assertIn('--query=hashcat', run.call_args.args[0])
+        self.assertTrue(entry.favorite)
+
+    def test_save_failure_stays_open_without_marking_favorite(self):
+        entry = vault.Entry('printf hello')
+        responses = [subprocess.CompletedProcess([],0,'\nalt-f\n0\trow\n',''), subprocess.CompletedProcess([],130,'','')]
+        with patch.object(vault.shutil,'which',return_value='fzf'), patch.object(vault.subprocess,'run',side_effect=responses) as run, patch.object(vault,'update_favorite',side_effect=OSError('disk full')):
+            self.assertIsNone(vault.pick([entry],'',False))
+        self.assertFalse(entry.favorite)
+        self.assertTrue(any('Save failed' in arg for arg in run.call_args.args[0]))
+
+    def test_enter_returns_original_not_ansi_display(self):
+        command = 'printf "<hi>" | cat\nnext\tline'
+        with patch.object(vault.shutil,'which',return_value='fzf'), patch.object(vault.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'\n\n0\tignored\n','')):
+            self.assertEqual(vault.pick([vault.Entry(command,favorite=True)],'',True),('',command))
+
+    def test_exact_pipeline_persistence_and_favorites_list(self):
+        import contextlib
+        import io
+        from unittest.mock import MagicMock
+        command = "hcxwltool -i the_list.txt --straight | sort | uniq | hashcat -m 22000 hashfile.hc22000"
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'XDG_DATA_HOME':folder}):
+            # Windows can verify serialization; the Linux lock is tested by the POSIX suite.
+            lock = contextlib.nullcontext() if os.name == 'posix' else patch.dict(sys.modules, {'fcntl':MagicMock()})
+            with lock:
+                vault.update_favorite(vault.favorites_path(),command)
+            output=io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(vault.main(['--favorites','--list']),0)
+            self.assertEqual(output.getvalue(),command+'\n')
 
 
 if __name__ == "__main__":
