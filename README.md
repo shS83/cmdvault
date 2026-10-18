@@ -1,4 +1,4 @@
-# cmdvault 0.1.3
+# cmdvault 0.1.6
 
 Find the useful commands buried in your own Bash history. Search with fzf,
 keep favorites, run commands, or copy an exact command to the clipboard.
@@ -16,8 +16,15 @@ sudo pacman -S --needed python fzf
 ./install.sh
 ```
 
-Make sure `~/.local/bin` is on PATH. The installer copies only the executable;
-it does not edit shell configuration. `XDG_BIN_HOME` overrides its destination.
+Make sure `~/.local/bin` is on PATH. The installer copies the executable and Bash integration;
+it does not edit shell configuration. `XDG_BIN_HOME` overrides the executable destination.
+For Enter to run in your existing shell, add this at the end of `~/.bashrc` and source it in open terminals:
+
+```bash
+source "${XDG_DATA_HOME:-$HOME/.local/share}/cmdvault/shell.bash"
+```
+
+Remove an old `cmdvault` alias if present (`unalias cmdvault`) so the function is used.
 
 ## Use
 
@@ -41,7 +48,7 @@ Inside the picker:
 | --- | --- |
 | Enter | Run the original command in Bash |
 | Ctrl-S / Alt-F | Save a favorite, turn the row yellow and stay in the picker |
-| Ctrl-D | Delete all exact matches from the selected history file and favorites; stay open |
+| Ctrl-D | Ask “Deleting COMMAND, are you sure? y/n”; y + Enter deletes all exact matches from history and favorites |
 | Ctrl-Y | Copy the original command to the clipboard and exit |
 | Esc | Cancel |
 
@@ -49,11 +56,13 @@ With `--copy`, Enter copies the selection. Ctrl-S / Alt-F only save; they do not
 unavailable or `copy()` fails, the command is printed instead and cmdvault exits
 with an error. OSC 52 has no confirmation of clipboard delivery, so a successful
 copy reports that the command was sent to `copy()`.
-Enter executes the selected command (including pipes and redirections) in the current directory. Bash loads `~/.bashrc` so configured aliases/functions are available. The terminal and environment are inherited, and the command exit status is returned. `cd` and variable assignments affect only this child shell, not the calling shell.
+With the Bash integration loaded, Enter executes the original selected command in the current shell, including pipes, redirections, aliases and functions. It does not reload `.bashrc`. `cd` changes the terminal's directory, and unexported variables such as `$HOME2` are available. The selected command's exit status is returned. A private temporary file transfers only an Enter selection and is removed before execution; list/print/copy output is never evaluated. Commands such as `exit` affect the current shell too.
+
+Without integration (or with `command cmdvault` / a direct executable path), Enter still uses a child interactive Bash. That fallback loads `.bashrc`; directory changes and assignments cannot affect the parent terminal.
 
 Use `--print` for the previous print-only behavior. `--copy`, Ctrl-Y, saving favorites and browsing never execute the selected command. Diagnostic messages go to stderr.
 
-Saved rows are yellow and marked with a star. Saving preserves the search query and returns to the picker; Esc afterwards does not undo the save. Alt-F is available if the terminal intercepts Ctrl-S.
+Saved rows are yellow and marked with a star. Saving preserves the search query, list order and selected result position; Esc afterwards does not undo the save. Deletion and cancelling deletion also preserve the query and position (the next available result is selected after removal, or the last result at the end). Favorites move to the top only when starting a new picker session. Alt-F is available if the terminal intercepts Ctrl-S.
 
 Duplicates are combined, with favorites first and then most recently used
 commands. The `Nx` column counts occurrences in the currently loaded history
@@ -63,6 +72,20 @@ filter. The picker escapes newlines, tabs, quotes and control characters for
 display, while saving, printing and copying preserve the original command.
 
 ## History and storage
+
+Possible secrets are detected locally and shown first in **red**, ahead of yellow
+favorites, with a `POSSIBLE SECRET` label and reason. This also applies to saved
+favorites. Detection covers literal credential assignments/options, Bearer tokens,
+several recognizable API-token prefixes, and PEM/OpenSSH private-key headers.
+Contiguous body/footer rows of pasted untimestamped private keys are also flagged.
+Variable references such as `$API_KEY`, public SSH keys and private-key file paths
+are not treated as literal secrets. Search still filters the list, but preserves
+priority order rather than reordering by fuzzy score.
+
+These are heuristics, not verification: false positives and missed secrets are
+possible. No network calls or extra credential reports are made. Original commands
+remain visible and unchanged; Ctrl-D still requires confirmation, and nothing is
+automatically deleted. `--list` remains plain command output, without color/labels.
 
 The default input is the exported `HISTFILE`, or `~/.bash_history` when it is
 unset. A child process cannot read unsaved history from your running Bash:
@@ -109,7 +132,8 @@ or custom EXIT traps may interfere; remove conflicting history-writing hooks.
 
 Ctrl-D removes every exact occurrence of the selected logical command (including
 its timestamp and multiline body) from the active `--history`/HISTFILE file, and
-removes it from favorites. It clears the current picker query and continues.
+removes it from favorites, only after y + Enter confirms the displayed command.
+Any other answer cancels deletion. The current query is retained to preserve your place.
 No backup containing the deleted secret is created. Other history entries are
 preserved. Deletion errors are shown without repeating the selected text.
 
@@ -121,5 +145,5 @@ unsaved commands in that shell). If a real credential was exposed, rotate it.
 Concurrent writes are serialized only for cooperating integrations; arbitrary
 external writers cannot be made transaction-safe by this program alone.
 
-Validation on the editing host: 15 tests passed; 8 Linux integration tests skipped.
+Validation on the editing host: 23 tests passed; 9 Linux integration tests skipped.
 Bash/WSL execution is blocked by the host sandbox; run the full suite in WSL.

@@ -17,6 +17,54 @@ sys.modules[spec.name] = vault
 loader.exec_module(vault)
 
 
+class SecretDetectionTests(unittest.TestCase):
+    def test_literal_credentials_and_known_shapes(self):
+        commands = [
+            'export OPENAI_API_KEY="' + 'sk-proj-' + 'a' * 30 + '"',
+            'curl -H "Authorization: Bearer synthetic.token.123456" localhost',
+            'curl --api-key synthetic-value-123 localhost',
+            'export AWS_SECRET_ACCESS_KEY=synthetic-value-123',
+            'client_secret: "synthetic-value-123"',
+            'echo ghp_' + 'a' * 36,
+            '-----BEGIN OPENSSH PRIVATE KEY-----\nsynthetic\n-----END OPENSSH PRIVATE KEY-----',
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertTrue(vault.secret_reasons(command))
+
+    def test_variable_references_public_keys_and_paths_are_not_secrets(self):
+        for command in ['curl -H "Authorization: Bearer $TOKEN" localhost',
+                        'export API_KEY="$OTHER_KEY"', 'curl --api-key ${API_KEY}',
+                        'ssh -i ~/.ssh/id_ed25519 host', 'cat ~/.ssh/id_rsa',
+                        'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest user@host',
+                        'echo hello', 'API_KEY=YOUR_API_KEY']:
+            with self.subTest(command=command):
+                self.assertEqual(vault.secret_reasons(command), ())
+
+    def test_secret_priority_color_and_literal_selection(self):
+        secret = 'API_KEY=synthetic-value-123'
+        entries = vault.entries_from(secret + '\nnormal\n', ['favorite', secret])
+        self.assertEqual([e.command for e in entries], [secret, 'favorite', 'normal'])
+        row = vault.entry_row(0, entries[0])
+        self.assertIn('\x1b[31m', row)
+        self.assertNotIn('\x1b[33m', row)
+        self.assertIn('POSSIBLE SECRET', row)
+        self.assertIn('★', row)
+        self.assertIn('\x1b[33m', vault.entry_row(1, entries[1]))
+        with patch.object(vault.shutil, 'which', return_value='fzf'), patch.object(vault.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '\n\n0\trow\n', '')) as run:
+            self.assertEqual(vault.pick(entries, '', False), ('', secret))
+        self.assertIn('--no-sort', run.call_args.args[0])
+        self.assertTrue(any('1 possible secret(s)' in arg for arg in run.call_args.args[0]))
+
+    def test_pasted_private_key_rows_and_context_end(self):
+        history = '-----BEGIN OPENSSH PRIVATE KEY-----\n' + 'A' * 64 + '\n-----END OPENSSH PRIVATE KEY-----\nnormal\n'
+        entries = vault.entries_from(history, [])
+        self.assertEqual(sum(bool(e.secrets) for e in entries), 3)
+        self.assertEqual(entries[-1].command, 'normal')
+        entries = vault.entries_from('-----BEGIN RSA PRIVATE KEY-----\nls\n' + 'B' * 64, [])
+        self.assertEqual(sum(bool(e.secrets) for e in entries), 1)
+
+
 class HistoryTests(unittest.TestCase):
     def test_plain_history_deduplication_and_order(self):
         entries = vault.entries_from("ls\nffmpeg -i 'a b'\nls\n", ["ssh host", "ls"])
@@ -129,6 +177,38 @@ class VaultTests(unittest.TestCase):
 
 
 class PickerRegressionTests(unittest.TestCase):
+    def test_save_and_delete_keep_filtered_position_and_order(self):
+        for key, accepted in [('ctrl-s', True), ('ctrl-d', True), ('ctrl-d', False)]:
+            entries = [vault.Entry(f'echo {i}') for i in range(20)]
+            calls = []
+            def picker(args, **kwargs):
+                calls.append((args, kwargs))
+                if len(calls) == 1:
+                    Path(kwargs['env']['CMDVAULT_POSITION_FILE']).write_text('7')
+                    return subprocess.CompletedProcess([], 0, f'echo\n{key}\n15\trow\n', '')
+                return subprocess.CompletedProcess([], 130, '', '')
+            with self.subTest(key=key, accepted=accepted), patch.object(vault.shutil, 'which', return_value='fzf'), patch.object(vault.subprocess, 'run', side_effect=picker), patch.object(vault, 'confirm_delete', return_value=accepted), patch.object(vault, 'delete_entry', return_value=1) as delete, patch.object(vault, 'update_favorite'):
+                vault.pick(entries, 'echo', False)
+            self.assertIn('--bind=result:last+pos(7)+unbind(result)', calls[1][0])
+            self.assertIn('--query=echo', calls[1][0])
+            self.assertEqual(entries[0].command, 'echo 0')
+            self.assertEqual(delete.called, key == 'ctrl-d' and accepted)
+            if key == 'ctrl-s':
+                self.assertTrue(entries[15].favorite)
+            if key == 'ctrl-d' and not accepted:
+                self.assertEqual(len(entries), 20)
+
+    def test_confirmation_accepts_only_y_and_escapes_control_characters(self):
+        import io
+        for answer in ('y\n', 'Y\n', 'n\n', '\n', '', 'yes\n'):
+            class Terminal(io.StringIO):
+                def close(self): pass
+            output, source = Terminal(), Terminal(answer)
+            with patch('builtins.open', side_effect=[output, source]):
+                self.assertEqual(vault.confirm_delete('echo\n\x1b[2J'), answer.strip().lower() == 'y')
+            self.assertIn('Deleting echo\\n\\u001b[2J, are you sure?', output.getvalue())
+            self.assertNotIn('\x1b', output.getvalue())
+
     def test_save_stays_open_colors_row_and_preserves_pipeline(self):
         command = "hcxwltool -i the_list.txt --straight | sort | uniq | hashcat -m 22000 hashfile.hc22000"
         entry = vault.Entry(command)
@@ -172,6 +252,33 @@ class PickerRegressionTests(unittest.TestCase):
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_shell_transfer_only_for_enter_and_preserves_newlines(self):
+        import contextlib
+        import io
+        command = 'cd "$HOME2"\nprintf done\n\n'
+        cases = [([], ('', command), True), (['--print'], ('', command), False),
+                 (['--list'], None, False), (['--copy'], ('', command), False),
+                 ([], ('ctrl-y', command), False), ([], None, False)]
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / 'selection'
+            for args, selection, transferred in cases:
+                output.write_bytes(b'')
+                with self.subTest(args=args, selection=selection), patch.object(vault, 'read_favorites', return_value=[command]), patch.object(vault, 'pick', return_value=selection), patch.object(vault, 'execute_command') as execute, patch.object(vault, 'copy_command'), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    vault.main(['--favorites', '--shell-output', str(output), *args])
+                    self.assertEqual(output.read_bytes(), command.encode() + b'\x00' if transferred else b'')
+                    execute.assert_not_called()
+
+    def test_failed_copy_never_transfers_executable_selection(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / 'selection'
+            output.write_bytes(b'')
+            with patch.object(vault, 'read_favorites', return_value=['echo test']), patch.object(vault, 'pick', return_value=('ctrl-y', 'echo test')), patch.object(vault, 'copy_command', side_effect=ValueError('copy failed')), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(ValueError):
+                    vault.main(['--favorites', '--shell-output', str(output)])
+            self.assertEqual(output.read_bytes(), b'')
+
     def test_execution_preserves_exact_command_and_terminal(self):
         command = "printf '%s' 'a b' | cat > output.txt\nprintf done"
         with patch.object(vault.shutil, 'which', return_value='/usr/bin/bash'), patch.object(vault.os, 'execv') as execute:
@@ -234,7 +341,8 @@ class HistoryDeletionTests(unittest.TestCase):
             self.assertEqual(path.read_text(),'secret\n')
             self.assertFalse(list(Path(folder).glob('.cmdvault-history-*')))
 
-    def test_ctrl_d_removes_row_clears_query_and_never_executes(self):
+    @patch.object(vault, 'confirm_delete', return_value=True)
+    def test_ctrl_d_removes_row_preserves_query_and_never_executes(self, confirm):
         entries=[vault.Entry('secret',favorite=True),vault.Entry('keep')]
         responses=[subprocess.CompletedProcess([],0,'secret\nctrl-d\n0\trow\n',''),subprocess.CompletedProcess([],130,'','')]
         with patch.object(vault.shutil,'which',return_value='fzf'),patch.object(vault.subprocess,'run',side_effect=responses) as run,patch.object(vault,'delete_entry',return_value=2) as delete,patch.object(vault,'execute_command') as execute:
@@ -242,13 +350,38 @@ class HistoryDeletionTests(unittest.TestCase):
         delete.assert_called_once_with(Path('/test/history'),'secret')
         self.assertEqual([entry.command for entry in entries],['keep'])
         self.assertNotIn('secret',run.call_args.kwargs['input'])
-        self.assertIn('--query=',run.call_args.args[0])
+        self.assertIn('--query=secret',run.call_args.args[0])
         execute.assert_not_called()
 
 
 
 @unittest.skipUnless(os.name == 'posix', 'Requires Linux Bash and flock')
 class BashIntegrationTests(unittest.TestCase):
+    def test_enter_changes_parent_directory_without_reloading_bashrc(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            target = base / 'directory with spaces'
+            target.mkdir()
+            stub = base / 'cmdvault'
+            stub.write_text('#!/bin/bash\n[[ $1 == --shell-output ]] || exit 20\nprintf "%s\\0" "$SELECTED_COMMAND" > "$2"\n')
+            stub.chmod(0o755)
+            script = r'''source "$1"
+HOME2=$2
+export SELECTED_COMMAND='cd "$HOME2"'
+cmdvault || exit 21
+[[ $PWD == "$HOME2" ]] || exit 22
+alias vault_test_alias='cd /'
+export SELECTED_COMMAND=vault_test_alias
+cmdvault || exit 23
+[[ $PWD == / ]] || exit 24
+export SELECTED_COMMAND='false'
+cmdvault
+[[ $? == 1 ]] || exit 25
+'''
+            env = dict(os.environ, PATH=str(base) + os.pathsep + os.environ['PATH'], HISTFILE=str(base / 'history'))
+            result = subprocess.run(['bash', '--noprofile', '--norc', '-ic', script, 'test', str(ROOT / 'cmdvault.bash'), str(target)], env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_sync_preserves_prompt_hooks_and_reloads_deletions(self):
         with tempfile.TemporaryDirectory() as folder:
             history=Path(folder)/'history'

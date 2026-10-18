@@ -2,7 +2,7 @@
 """Find and keep useful commands from your own Bash history."""
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -12,7 +12,36 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "0.1.3"
+VERSION = "0.1.6"
+
+PRIVATE_KEY = re.compile(r'-----BEGIN (?:OPENSSH |RSA |EC |DSA |ENCRYPTED )?PRIVATE KEY-----')
+BEARER = re.compile(r'\bBearer\s+([A-Za-z0-9._~+/=-]{8,})', re.IGNORECASE)
+SECRET_VALUE = re.compile(
+    r'''(?ix)(?<![\w${])(?:[a-z][a-z0-9_]*_)?
+    (?:api[_-]?key|access[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|token|password|passwd)
+    ["']?\s*(?:=|:|\s)\s*["']?([^\s"'`;|&<>]+)''')
+TOKEN_SHAPES = re.compile(
+    r'(?<![\w])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}'
+    r'|sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})(?![\w])')
+
+
+def secret_reasons(command):
+    """Local heuristics only: never validate credentials or send them anywhere."""
+    reasons = []
+    if PRIVATE_KEY.search(command):
+        reasons.append('private key')
+    if BEARER.search(command):
+        reasons.append('Bearer token')
+    if TOKEN_SHAPES.search(command):
+        reasons.append('API token pattern')
+    for match in SECRET_VALUE.finditer(command):
+        value = match.group(1)
+        # References to shell variables are not literal credentials.
+        if len(value) >= 8 and not value.startswith(('$', '`')) and value.lower() not in (
+                'your_api_key', 'your_token', 'changeme', 'redacted', '[redacted]'):
+            reasons.append('literal credential')
+            break
+    return tuple(reasons)
 
 
 @dataclass
@@ -21,6 +50,10 @@ class Entry:
     count: int = 0
     recent: int = -1
     favorite: bool = False
+    secrets: tuple = field(init=False)
+
+    def __post_init__(self):
+        self.secrets = secret_reasons(self.command)
 
 
 def history_commands(text):
@@ -152,15 +185,29 @@ def delete_entry(path, command):
 
 def entries_from(history, favorites):
     entries = {}
+    in_private_key = False
     for index, command in enumerate(history_commands(history)):
         if "\0" in command:
             continue
         entry = entries.setdefault(command, Entry(command))
+        # Untimestamped history represents a pasted PEM block as separate rows.
+        # Carry the warning only across contiguous key body/footer lines.
+        stripped = command.strip()
+        if in_private_key:
+            if re.fullmatch(r'[A-Za-z0-9+/=]{16,}', stripped) or re.fullmatch(
+                    r'-----END (?:OPENSSH |RSA |EC |DSA |ENCRYPTED )?PRIVATE KEY-----', stripped):
+                entry.secrets = tuple(dict.fromkeys((*entry.secrets, 'private key fragment')))
+            else:
+                in_private_key = False
+        if PRIVATE_KEY.fullmatch(stripped):
+            in_private_key = True
+        elif stripped.startswith('-----END '):
+            in_private_key = False
         entry.count += 1
         entry.recent = index
     for command in favorites:
         entries.setdefault(command, Entry(command)).favorite = True
-    return sorted(entries.values(), key=lambda entry: (entry.favorite, entry.recent), reverse=True)
+    return sorted(entries.values(), key=lambda entry: (bool(entry.secrets), entry.favorite, entry.recent), reverse=True)
 
 
 def display(command):
@@ -168,28 +215,50 @@ def display(command):
     return json.dumps(command, ensure_ascii=False)[1:-1]
 
 
+def entry_row(index, entry):
+    color = '\x1b[31m' if entry.secrets else '\x1b[33m' if entry.favorite else ''
+    warning = '[POSSIBLE SECRET: ' + ', '.join(entry.secrets) + '] ' if entry.secrets else ''
+    return (f'{index}\t{color}{warning}' +
+            f"{'★' if entry.favorite else '·'}  {entry.count:>4}x  {display(entry.command)}" +
+            ('\x1b[0m' if color else '') + '\n')
+
+
+def confirm_delete(command, terminal="/dev/tty"):
+    """Ask on the terminal, never consume piped input or emit executable output."""
+    with open(terminal, 'w', encoding='utf-8') as output, open(terminal, 'r', encoding='utf-8') as source:
+        output.write(f'Deleting {display(command)}, are you sure? y/n [n]: ')
+        output.flush()
+        return source.readline().strip().lower() == 'y'
+
+
 def pick(entries, query, favorites_only, enter_action="run", history_path=None):
+    with tempfile.TemporaryDirectory(prefix='cmdvault-picker-') as folder:
+        return pick_loop(entries, query, favorites_only, enter_action, history_path,
+                         Path(folder) / 'position')
+
+
+def pick_loop(entries, query, favorites_only, enter_action, history_path, position_path):
     fzf = shutil.which("fzf")
     if not fzf:
         raise ValueError("fzf is required for the picker. Install it or use --list.")
     env = os.environ.copy()
     env.pop("FZF_DEFAULT_OPTS", None)
     env.pop("FZF_DEFAULT_OPTS_FILE", None)
+    env['CMDVAULT_POSITION_FILE'] = str(position_path)
     position = 1
     notice = ""
     while True:
-        rows = "".join(
-            f"{index}\t" + ("\x1b[33m" if entry.favorite else "") +
-            f"{'★' if entry.favorite else '·'}  {entry.count:>4}x  {display(entry.command)}" +
-            ("\x1b[0m" if entry.favorite else "") + "\n"
-            for index, entry in enumerate(entries)
-        )
+        rows = ''.join(entry_row(index, entry) for index, entry in enumerate(entries))
+        warnings = sum(bool(entry.secrets) for entry in entries)
         result = subprocess.run(
-            [fzf, "--ansi", "--delimiter=\t", "--with-nth=2..", "--no-multi", "--layout=reverse",
+            [fzf, "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--no-multi", "--layout=reverse",
              "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
              "--border-label= CMDVAULT / " + ("FAVORITES " if favorites_only else "HISTORY "),
-             "--header=ENTER " + enter_action + " · CTRL-S / ALT-F save favorite (stay open) · CTRL-D delete permanently · CTRL-Y copy · ESC cancel" + notice,
-             "--bind=start:pos(" + str(position) + ")",
+             "--header=ENTER " + enter_action + " · CTRL-S / ALT-F save favorite (stay open) · CTRL-D delete permanently · CTRL-Y copy · ESC cancel" +
+             f"\n{warnings} possible secret(s): red rows first. Review and use CTRL-D to remove." + notice,
+             "--sync", "--with-shell=bash -c",
+             "--bind=result:last+pos(" + str(position) + ")+unbind(result)",
+             '--bind=focus:execute-silent(printf "%s" "$FZF_POS" > "$CMDVAULT_POSITION_FILE")',
              "--expect=ctrl-s,alt-f,ctrl-y,ctrl-d", "--query=" + query],
             input=rows, capture_output=True, text=True, env=env,
         )
@@ -207,15 +276,21 @@ def pick(entries, query, favorites_only, enter_action="run", history_path=None):
                 raise ValueError
         except ValueError:
             raise ValueError("Invalid picker selection.") from None
+        try:
+            position = max(1, int(position_path.read_text(encoding='utf-8')))
+        except (OSError, ValueError):
+            position = index + 1
         if key == "ctrl-d":
             try:
+                if not confirm_delete(entries[index].command):
+                    notice = "\nDeletion cancelled."
+                    continue
                 target = history_path or Path(os.environ.get("HISTFILE") or Path.home() / ".bash_history")
                 count = delete_entry(target, entries[index].command)
             except (OSError, ValueError):
                 notice = "\nDeletion failed or was partial. Reload history and check file permissions; the command was not printed."
             else:
                 entries.pop(index)
-                query = ""  # A search query can itself contain the deleted secret.
                 notice = f"\nDeleted {count} history occurrence(s) and removed the favorite."
                 if not entries:
                     print("cmdvault: Selected command deleted; no entries remain.", file=sys.stderr)
@@ -229,11 +304,8 @@ def pick(entries, query, favorites_only, enter_action="run", history_path=None):
             notice = "\nSave failed: " + display(str(error))
         else:
             entries[index].favorite = True
-            notice = "\n★ Favorite saved. Yellow rows are saved favorites."
-        # Keep the selected command near the top without changing its original text.
-        entry = entries.pop(index)
-        entries.insert(0, entry)
-        position = 1
+            notice = "\n★ Favorite saved. Possible secrets stay red; other favorites are yellow."
+        # Preserve ordering for this picker session, including filtered results.
 
 
 def copy_command(command, functions_file=None, terminal="/dev/tty"):
@@ -272,6 +344,7 @@ def main(argv=None):
                         default=Path(os.environ.get("HISTFILE") or Path.home() / ".bash_history"),
                         help="Bash history file (default: HISTFILE or ~/.bash_history)")
     parser.add_argument("--favorites", action="store_true", help="show only saved commands")
+    parser.add_argument("--shell-output", type=Path, help=argparse.SUPPRESS)
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--list", action="store_true", help="print commands without fzf")
     actions.add_argument("--print", dest="print_only", action="store_true", help="print the selection instead of running it")
@@ -317,6 +390,10 @@ def main(argv=None):
         print("cmdvault: Sent to copy().", file=sys.stderr)
     elif args.print_only:
         print(command)
+    elif args.shell_output is not None:
+        # A private file separates executable selections from all normal output,
+        # including --list, --print and clipboard failure diagnostics.
+        args.shell_output.write_bytes(command.encode('utf-8') + b'\x00')
     else:
         execute_command(command)
     return 0

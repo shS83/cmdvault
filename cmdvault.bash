@@ -1,5 +1,28 @@
 # Source from ~/.bashrc; requires Bash and util-linux flock.
 [[ $- == *i* ]] || return
+
+# Execute Enter selections in the caller so cd, aliases and unexported
+# variables use the existing shell without sourcing .bashrc again.
+cmdvault() {
+    local _cmdvault_selection_file _cmdvault_selected _cmdvault_status
+    _cmdvault_selection_file=$(mktemp "${TMPDIR:-/tmp}/cmdvault-selection.XXXXXXXXXX") || return
+    if command cmdvault --shell-output "$_cmdvault_selection_file" "$@"; then
+        _cmdvault_status=0
+    else
+        _cmdvault_status=$?
+    fi
+    if (( _cmdvault_status != 0 )); then
+        command rm -f -- "$_cmdvault_selection_file"
+        return "$_cmdvault_status"
+    fi
+    if IFS= read -r -d '' _cmdvault_selected < "$_cmdvault_selection_file"; then
+        command rm -f -- "$_cmdvault_selection_file" || return
+        builtin eval -- "$_cmdvault_selected"
+    else
+        command rm -f -- "$_cmdvault_selection_file"
+    fi
+}
+
 command -v flock >/dev/null || { printf 'cmdvault: install util-linux for history synchronization.\n' >&2; return; }
 [[ ${HISTFILE+x} ]] || HISTFILE=$HOME/.bash_history
 export HISTFILE
