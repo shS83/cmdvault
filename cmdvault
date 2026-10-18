@@ -12,7 +12,21 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
+
+# Require data fields as well as a prefix: documentation mentioning "$6$"
+# or shell references such as "$6" alone should not trigger a warning.
+PASSWORD_HASH_PATTERNS = (
+    ('yescrypt', re.compile(r'\$y\$[./A-Za-z0-9]+\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
+    ('gost-yescrypt', re.compile(r'\$gy\$[./A-Za-z0-9]+\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
+    ('scrypt', re.compile(r'\$7\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
+    ('SHA-512-crypt', re.compile(r'\$6\$(?:rounds=\d+\$)?[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
+    ('SHA-256-crypt', re.compile(r'\$5\$(?:rounds=\d+\$)?[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
+    ('MD5-crypt', re.compile(r'\$1\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
+    ('Apache MD5-crypt', re.compile(r'\$apr1\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
+    ('bcrypt', re.compile(r'\$2[abxy]?\$\d{2}\$[./A-Za-z0-9]{8,}')),
+    ('Argon2', re.compile(r'\$argon2(?:id|i|d)\$(?:v=\d+\$)?m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]{8,}')),
+)
 
 PRIVATE_KEY = re.compile(r'-----BEGIN (?:OPENSSH |RSA |EC |DSA |ENCRYPTED )?PRIVATE KEY-----')
 BEARER = re.compile(r'\bBearer\s+([A-Za-z0-9._~+/=-]{8,})', re.IGNORECASE)
@@ -28,6 +42,11 @@ TOKEN_SHAPES = re.compile(
 def secret_reasons(command):
     """Local heuristics only: never validate credentials or send them anywhere."""
     reasons = []
+    # Shell-escaped dollar signs still represent the same literal hash.
+    hash_text = command.replace('\\$', '$')
+    for name, pattern in PASSWORD_HASH_PATTERNS:
+        if pattern.search(hash_text):
+            reasons.append(name + ' password hash')
     if PRIVATE_KEY.search(command):
         reasons.append('private key')
     if BEARER.search(command):

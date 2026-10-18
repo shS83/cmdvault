@@ -1,4 +1,4 @@
-# cmdvault 0.1.6
+# cmdvault 0.1.7
 
 Find the useful commands buried in your own Bash history. Search with fzf,
 keep favorites, run commands, or copy an exact command to the clipboard.
@@ -77,6 +77,13 @@ Possible secrets are detected locally and shown first in **red**, ahead of yello
 favorites, with a `POSSIBLE SECRET` label and reason. This also applies to saved
 favorites. Detection covers literal credential assignments/options, Bearer tokens,
 several recognizable API-token prefixes, and PEM/OpenSSH private-key headers.
+Password-hash warnings also cover yescrypt (`$y$`), gost-yescrypt (`$gy$`),
+scrypt (`$7$`), SHA-512-crypt (`$6$`), SHA-256-crypt (`$5$`), MD5-crypt (`$1$`),
+Apache MD5 (`$apr1$`), bcrypt (`$2a$`, `$2b$`, `$2x$`, `$2y$`, legacy `$2$`),
+and Argon2d/i/id. Hash-shaped data is required beyond the prefix; these checks
+also recognize shell-escaped dollar signs and hashes inside shadow records.
+This is format detection, not cryptographic validation. Bare hexadecimal strings
+are not flagged as password hashes because they may simply be file checksums.
 Contiguous body/footer rows of pasted untimestamped private keys are also flagged.
 Variable references such as `$API_KEY`, public SSH keys and private-key file paths
 are not treated as literal secrets. Search still filters the list, but preserves
@@ -145,5 +152,5 @@ unsaved commands in that shell). If a real credential was exposed, rotate it.
 Concurrent writes are serialized only for cooperating integrations; arbitrary
 external writers cannot be made transaction-safe by this program alone.
 
-Validation on the editing host: 23 tests passed; 9 Linux integration tests skipped.
+Validation on the editing host: 26 tests passed; 9 Linux integration tests skipped.
 Bash/WSL execution is blocked by the host sandbox; run the full suite in WSL.

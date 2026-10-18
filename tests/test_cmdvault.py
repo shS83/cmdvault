@@ -18,6 +18,40 @@ loader.exec_module(vault)
 
 
 class SecretDetectionTests(unittest.TestCase):
+    def test_password_hash_formats_in_commands_and_shadow_rows(self):
+        examples = {
+            'yescrypt': '$y$j9T$testsalt$FAKEhash12345678',
+            'gost-yescrypt': '$gy$j9T$testsalt$FAKEhash12345678',
+            'scrypt': '$7$C6..testsalt$FAKEhash12345678',
+            'SHA-512-crypt': '$6$rounds=5000$testsalt$FAKEhash12345678',
+            'SHA-256-crypt': '$5$testsalt$FAKEhash12345678',
+            'MD5-crypt': '$1$testsalt$FAKEhash12345678',
+            'Apache MD5-crypt': '$apr1$testsalt$FAKEhash12345678',
+            'bcrypt': '$2b$12$FAKEsaltANDhash12345678',
+            'Argon2': '$argon2id$v=19$m=65536,t=3,p=4$dGVzdA$FAKEhash12345678',
+        }
+        for name, value in examples.items():
+            for command in ("printf '%s' '" + value + "'", 'testuser:!' + value + ':20000:0:99999:7:::', value.replace('$', '\\$')):
+                with self.subTest(name=name, command=command):
+                    self.assertIn(name + ' password hash', vault.secret_reasons(command))
+        for prefix in ('2', '2a', '2x', '2y'):
+            self.assertIn('bcrypt password hash', vault.secret_reasons('$' + prefix + '$10$FAKEhash12345678'))
+        for variant in ('argon2d', 'argon2i'):
+            self.assertIn('Argon2 password hash', vault.secret_reasons('$' + variant + '$m=8192,t=2,p=1$c2FsdA$FAKEhash12345678'))
+
+    def test_prefixes_variables_and_checksums_do_not_trigger_hash_warning(self):
+        for command in ("echo '$y$ $6$ $5$ $1$ $2b$ $argon2id$'", 'echo "$6" "$year"',
+                        'echo ' + 'a' * 32, 'echo ' + 'b' * 64,
+                        "echo '$6$salt$'", "echo '$y$params$salt$'"):
+            self.assertEqual(vault.secret_reasons(command), ())
+
+    def test_hash_warning_is_red_and_first_without_changing_command(self):
+        command = "echo '$6$testsalt$FAKEhash12345678'"
+        entries = vault.entries_from(command + '\nls\n', ['pwd'])
+        self.assertEqual(entries[0].command, command)
+        self.assertIn('\x1b[31m', vault.entry_row(0, entries[0]))
+        self.assertIn('SHA-512-crypt password hash', vault.entry_row(0, entries[0]))
+
     def test_literal_credentials_and_known_shapes(self):
         commands = [
             'export OPENAI_API_KEY="' + 'sk-proj-' + 'a' * 30 + '"',
