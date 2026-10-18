@@ -197,5 +197,81 @@ class ExecutionTests(unittest.TestCase):
                 if should_run: execute.assert_called_once_with('echo hello')
 
 
+class HistoryDeletionTests(unittest.TestCase):
+    def test_exact_duplicates_only(self):
+        text='keep\nsecret\nprefix secret\nsecret\nlast'
+        self.assertEqual(vault.history_without(text,'secret'),('keep\nprefix secret\nlast',2))
+
+    def test_multiline_timestamps_and_unrelated_bytes(self):
+        text='legacy\r\n#1700000000\nfirst\nsecond\n#1700000001\nkeep\n#1700000002\nfirst\nsecond\n'
+        cleaned,count=vault.history_without(text,'first\nsecond')
+        self.assertEqual(count,2)
+        self.assertEqual(cleaned,'legacy\r\n#1700000001\nkeep\n')
+
+    def test_history_and_favorite_deleted_without_backup(self):
+        import contextlib
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ,{'XDG_DATA_HOME':folder}):
+            path=Path(folder)/'history'
+            path.write_text('keep\nsecret\nsecret\n',encoding='utf-8')
+            lock=contextlib.nullcontext() if os.name=='posix' else patch.dict(sys.modules,{'fcntl':MagicMock()})
+            with lock:
+                vault.update_favorite(vault.favorites_path(),'secret')
+                self.assertEqual(vault.delete_entry(path,'secret'),2)
+            self.assertEqual(path.read_text(),'keep\n')
+            self.assertEqual(vault.read_favorites(vault.favorites_path()),[])
+            self.assertFalse(list(Path(folder).glob('.cmdvault-history-*')))
+            self.assertFalse(list(Path(folder).glob('*.bak')))
+
+    def test_failed_replace_preserves_original(self):
+        import contextlib
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'history';path.write_text('secret\n',encoding='utf-8')
+            lock=contextlib.nullcontext() if os.name=='posix' else patch.dict(sys.modules,{'fcntl':MagicMock()})
+            with lock,patch.object(vault.os,'replace',side_effect=OSError('disk')):
+                with self.assertRaises(OSError):vault.delete_history_command(path,'secret')
+            self.assertEqual(path.read_text(),'secret\n')
+            self.assertFalse(list(Path(folder).glob('.cmdvault-history-*')))
+
+    def test_ctrl_d_removes_row_clears_query_and_never_executes(self):
+        entries=[vault.Entry('secret',favorite=True),vault.Entry('keep')]
+        responses=[subprocess.CompletedProcess([],0,'secret\nctrl-d\n0\trow\n',''),subprocess.CompletedProcess([],130,'','')]
+        with patch.object(vault.shutil,'which',return_value='fzf'),patch.object(vault.subprocess,'run',side_effect=responses) as run,patch.object(vault,'delete_entry',return_value=2) as delete,patch.object(vault,'execute_command') as execute:
+            self.assertIsNone(vault.pick(entries,'secret',False,history_path=Path('/test/history')))
+        delete.assert_called_once_with(Path('/test/history'),'secret')
+        self.assertEqual([entry.command for entry in entries],['keep'])
+        self.assertNotIn('secret',run.call_args.kwargs['input'])
+        self.assertIn('--query=',run.call_args.args[0])
+        execute.assert_not_called()
+
+
+
+@unittest.skipUnless(os.name == 'posix', 'Requires Linux Bash and flock')
+class BashIntegrationTests(unittest.TestCase):
+    def test_sync_preserves_prompt_hooks_and_reloads_deletions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            history=Path(folder)/'history'
+            script = r'''HISTFILE=$1
+PROMPT_COMMAND=('printf existing >/dev/null')
+source "$2"
+source "$2"
+[[ ${#PROMPT_COMMAND[@]} == 2 ]] || exit 11
+[[ ${PROMPT_COMMAND[0]} == _cmdvault_sync_history ]] || exit 12
+[[ ${PROMPT_COMMAND[1]} == 'printf existing >/dev/null' ]] || exit 13
+history -c
+history -s 'secret-for-test'
+_cmdvault_sync_history
+grep -q 'secret-for-test' "$HISTFILE" || exit 14
+printf 'keep\n' > "$HISTFILE"
+_cmdvault_sync_history
+history | grep -q 'secret-for-test' && exit 15
+history | grep -q keep || exit 16
+exit 0
+'''
+            result=subprocess.run(['bash','--noprofile','--norc','-ic',script,'test',str(history),str(ROOT/'cmdvault.bash')],capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

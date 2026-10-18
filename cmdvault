@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 
 @dataclass
@@ -86,6 +86,70 @@ def update_favorite(path, command, remove=False):
                 os.unlink(temporary)
 
 
+def history_without(text, command):
+    """Remove exact logical entries, preserving untouched bytes and timestamps."""
+    blocks = []
+    pending = None
+    for line in text.splitlines(keepends=True):
+        if re.fullmatch(r"#[0-9]+", line.rstrip("\r\n")):
+            if pending is not None:
+                blocks.append(pending)
+            pending = [line]
+        elif pending is not None:
+            pending.append(line)
+        else:
+            blocks.append([line])
+    if pending is not None:
+        blocks.append(pending)
+    kept = []
+    removed = 0
+    for block in blocks:
+        body = block[1:] if re.fullmatch(r"#[0-9]+", block[0].rstrip("\r\n")) else block
+        value = "\n".join(line.rstrip("\r\n") for line in body)
+        if value == command:
+            removed += 1
+        else:
+            kept.extend(block)
+    return "".join(kept), removed
+
+
+def delete_history_command(path, command):
+    """Delete all exact matches without creating a backup containing the secret."""
+    import fcntl
+    path = path.expanduser().resolve()
+    if not path.exists():
+        return 0
+    with open(str(path) + ".cmdvault.lock", "a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        original = path.read_bytes()
+        cleaned, removed = history_without(original.decode("utf-8"), command)
+        if not removed:
+            return 0
+        fd, temporary = tempfile.mkstemp(prefix=".cmdvault-history-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                output.write(cleaned.encode("utf-8"))
+                output.flush()
+                os.fsync(output.fileno())
+            if path.read_bytes() != original:
+                raise ValueError("History changed during deletion; retry.")
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    return removed
+
+
+def delete_entry(path, command):
+    # Preflight favorites so malformed data is never silently discarded.
+    favorite_file = favorites_path()
+    favorites = read_favorites(favorite_file)
+    count = delete_history_command(path, command)
+    if command in favorites:
+        update_favorite(favorite_file, command, remove=True)
+    return count
+
+
 def entries_from(history, favorites):
     entries = {}
     for index, command in enumerate(history_commands(history)):
@@ -104,7 +168,7 @@ def display(command):
     return json.dumps(command, ensure_ascii=False)[1:-1]
 
 
-def pick(entries, query, favorites_only, enter_action="run"):
+def pick(entries, query, favorites_only, enter_action="run", history_path=None):
     fzf = shutil.which("fzf")
     if not fzf:
         raise ValueError("fzf is required for the picker. Install it or use --list.")
@@ -124,9 +188,9 @@ def pick(entries, query, favorites_only, enter_action="run"):
             [fzf, "--ansi", "--delimiter=\t", "--with-nth=2..", "--no-multi", "--layout=reverse",
              "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
              "--border-label= CMDVAULT / " + ("FAVORITES " if favorites_only else "HISTORY "),
-             "--header=ENTER " + enter_action + " · CTRL-S / ALT-F save favorite (stay open) · CTRL-Y copy · ESC cancel" + notice,
+             "--header=ENTER " + enter_action + " · CTRL-S / ALT-F save favorite (stay open) · CTRL-D delete permanently · CTRL-Y copy · ESC cancel" + notice,
              "--bind=start:pos(" + str(position) + ")",
-             "--expect=ctrl-s,alt-f,ctrl-y", "--query=" + query],
+             "--expect=ctrl-s,alt-f,ctrl-y,ctrl-d", "--query=" + query],
             input=rows, capture_output=True, text=True, env=env,
         )
         if result.returncode in (1, 130):
@@ -134,7 +198,7 @@ def pick(entries, query, favorites_only, enter_action="run"):
         if result.returncode:
             raise ValueError("fzf failed: " + result.stderr.strip())
         lines = result.stdout.splitlines()
-        if len(lines) != 3 or lines[1] not in ("", "ctrl-s", "alt-f", "ctrl-y"):
+        if len(lines) != 3 or lines[1] not in ("", "ctrl-s", "alt-f", "ctrl-y", "ctrl-d"):
             raise ValueError("Invalid picker output.")
         query, key, row = lines
         try:
@@ -143,6 +207,20 @@ def pick(entries, query, favorites_only, enter_action="run"):
                 raise ValueError
         except ValueError:
             raise ValueError("Invalid picker selection.") from None
+        if key == "ctrl-d":
+            try:
+                target = history_path or Path(os.environ.get("HISTFILE") or Path.home() / ".bash_history")
+                count = delete_entry(target, entries[index].command)
+            except (OSError, ValueError):
+                notice = "\nDeletion failed or was partial. Reload history and check file permissions; the command was not printed."
+            else:
+                entries.pop(index)
+                query = ""  # A search query can itself contain the deleted secret.
+                notice = f"\nDeleted {count} history occurrence(s) and removed the favorite."
+                if not entries:
+                    print("cmdvault: Selected command deleted; no entries remain.", file=sys.stderr)
+                    return None
+            continue
         if key not in ("ctrl-s", "alt-f"):
             return key, entries[index].command
         try:
@@ -226,7 +304,7 @@ def main(argv=None):
     if not entries:
         print(f"cmdvault: No commands found. Favorites file: {path}. Save with Ctrl-S / Alt-F or --add; Ctrl-Y only copies.", file=sys.stderr)
         return 1
-    selected = pick(entries, query, args.favorites, "copy" if args.copy else "print" if args.print_only else "run")
+    selected = pick(entries, query, args.favorites, "copy" if args.copy else "print" if args.print_only else "run", args.history)
     if selected is None:
         return 1
     key, command = selected

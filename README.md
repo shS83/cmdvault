@@ -1,4 +1,4 @@
-# cmdvault 0.1.2
+# cmdvault 0.1.3
 
 Find the useful commands buried in your own Bash history. Search with fzf,
 keep favorites, run commands, or copy an exact command to the clipboard.
@@ -41,6 +41,7 @@ Inside the picker:
 | --- | --- |
 | Enter | Run the original command in Bash |
 | Ctrl-S / Alt-F | Save a favorite, turn the row yellow and stay in the picker |
+| Ctrl-D | Delete all exact matches from the selected history file and favorites; stay open |
 | Ctrl-Y | Copy the original command to the clipboard and exit |
 | Esc | Cancel |
 
@@ -69,7 +70,7 @@ run `history -a` before searching for something you have just used.
 Timestamped Bash history preserves multiline entry boundaries. In history
 without timestamps, each physical line is treated as a separate command.
 Only valid UTF-8 history is accepted; decoding errors are reported rather than
-silently changing the commands. History is read without modifying it.
+silently changing the commands. Browsing is read-only; Ctrl-D explicitly modifies the selected history file.
 
 Favorites are stored locally at `~/.local/share/cmdvault/favorites.json`, or
 under `$XDG_DATA_HOME/cmdvault`. The file is created with mode `0600`; updates
@@ -89,3 +90,36 @@ bash -n install.sh
 ```
 
 Tests use temporary history and favorites, plus a fake fzf and an isolated test `copy()` function. They do not inspect your shell history or use your clipboard.
+
+## Automatic Bash history and deletion
+
+After `bash install.sh`, add this line at the END of `~/.bashrc`:
+
+```bash
+source "${XDG_DATA_HOME:-$HOME/.local/share}/cmdvault/shell.bash"
+```
+
+Then run `source ~/.bashrc` in every already-open Bash terminal before using deletion.
+The integration preserves existing PROMPT_COMMAND entries, enables histappend,
+exports HISTFILE, and performs `history -a`, `history -c`, `history -r` under a
+shared lock before each prompt. Thus new commands are saved and stale in-memory
+entries are replaced by the file contents. It needs util-linux `flock` and GNU
+`readlink`, available on Arch. Existing hooks that independently rewrite history
+or custom EXIT traps may interfere; remove conflicting history-writing hooks.
+
+Ctrl-D removes every exact occurrence of the selected logical command (including
+its timestamp and multiline body) from the active `--history`/HISTFILE file, and
+removes it from favorites. It clears the current picker query and continues.
+No backup containing the deleted secret is created. Other history entries are
+preserved. Deletion errors are shown without repeating the selected text.
+
+This is logical deletion, not secure disk erasure: it cannot erase terminal
+scrollback, clipboard contents, backups, logs or other history files. Unintegrated
+shells can restore stale history. In any such open shell after deletion, use
+`history -c; history -r` to discard its in-memory history (this also discards any
+unsaved commands in that shell). If a real credential was exposed, rotate it.
+Concurrent writes are serialized only for cooperating integrations; arbitrary
+external writers cannot be made transaction-safe by this program alone.
+
+Validation on the editing host: 15 tests passed; 8 Linux integration tests skipped.
+Bash/WSL execution is blocked by the host sandbox; run the full suite in WSL.
