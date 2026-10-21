@@ -12,6 +12,15 @@ import subprocess
 import sys
 import tempfile
 
+# The installer places the same package beside the executable.
+from src.visuals.config import VisualConfig
+from src.visuals.ansi import fzf_options
+from src.visuals.detector import detect, select
+from src.visuals.diagnostics import run as graphics_test
+from src.visuals.picker import run_picker
+
+_VISUAL_CONFIG = VisualConfig()
+
 VERSION = "0.1.7"
 
 # Require data fields as well as a prefix: documentation mentioning "$6$"
@@ -265,12 +274,32 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
     env.pop("FZF_DEFAULT_OPTS_FILE", None)
     env['CMDVAULT_POSITION_FILE'] = str(position_path)
     position = 1
+    caps = detect(sys.stderr)
+    backend, fallback_notice = select(_VISUAL_CONFIG.renderer, caps, raster_layout=True)
+    if backend == "kitty":
+        try:
+            import PIL
+        except ImportError:
+            backend = "ansi"
+            fallback_notice = "Kitty graphics needs Pillow: uv sync --extra graphics; using ANSI."
+    if fallback_notice:
+        print("cmdvault: " + fallback_notice, file=sys.stderr)
+    neon_picker = backend == "kitty" and sys.stdin.isatty()
+    if neon_picker:
+        dimensions = shutil.get_terminal_size((80, 24))
+        neon_picker = dimensions.columns >= 32 and dimensions.lines >= 10
+    def invoke(argv, **kwargs):
+        if neon_picker:
+            argv = [arg for arg in argv if not arg.startswith(("--height=", "--border=", "--border-label="))]
+            argv += ["--no-clear", "--height=100%", "--border=none", "--margin=1,2"]
+            return run_picker(argv, input=kwargs["input"], env=kwargs["env"], config=_VISUAL_CONFIG)
+        return subprocess.run(argv, **kwargs)
     notice = ""
     while True:
         rows = ''.join(entry_row(index, entry) for index, entry in enumerate(entries))
         warnings = sum(bool(entry.secrets) for entry in entries)
-        result = subprocess.run(
-            [fzf, "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--no-multi", "--layout=reverse",
+        result = invoke(
+            [fzf, *fzf_options(detect(sys.stderr).truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--no-multi", "--layout=reverse",
              "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
              "--border-label= CMDVAULT / " + ("FAVORITES " if favorites_only else "HISTORY "),
              "--header=ENTER " + enter_action + " · CTRL-S / ALT-F save favorite (stay open) · CTRL-D delete permanently · CTRL-Y copy · ESC cancel" +
@@ -370,7 +399,21 @@ def main(argv=None):
     actions.add_argument("--copy", action="store_true", help="copy the selected command")
     actions.add_argument("--add", metavar="COMMAND", help="save an exact command as a favorite")
     actions.add_argument("--remove", metavar="COMMAND", help="remove an exact favorite")
+    parser.add_argument("--theme", choices=["neon"], default=None)
+    parser.add_argument("--graphics", choices=["auto", "kitty", "sixel", "ansi"], default=None)
+    parser.add_argument("--glow", type=float, default=None)
+    parser.add_argument("--fps", type=int, default=None, help="animation target FPS (1..30; default 30)")
+    parser.add_argument("--no-animation", action="store_true")
+    parser.add_argument("--graphics-test", action="store_true")
     args = parser.parse_args(argv)
+    global _VISUAL_CONFIG
+    stored = VisualConfig.load()
+    _VISUAL_CONFIG = VisualConfig(
+        theme=args.theme or stored.theme, renderer=args.graphics or stored.renderer,
+        glow=stored.glow if args.glow is None else args.glow,
+        animation=stored.animation and not args.no_animation, fps=stored.fps if args.fps is None else args.fps)
+    if args.graphics_test:
+        return graphics_test(_VISUAL_CONFIG, sys.stderr)
     if (args.add is not None or args.remove is not None) and args.query:
         parser.error("--add and --remove take one quoted command, without search terms")
     path = favorites_path()

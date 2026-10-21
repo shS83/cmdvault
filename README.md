@@ -111,7 +111,7 @@ picker bindings consistent.
 
 ## Development
 
-No Python packages are needed.
+The ANSI interface uses the Python standard library. Raster backends optionally use Pillow.
 
 ```bash
 uv run python -m unittest discover -s tests -v
@@ -154,3 +154,77 @@ external writers cannot be made transaction-safe by this program alone.
 
 Validation on the editing host: 26 tests passed; 9 Linux integration tests skipped.
 Bash/WSL execution is blocked by the host sandbox; run the full suite in WSL.
+
+
+## cmdvault Neon
+
+Kitty is the default renderer. In a direct Kitty session (`TERM=xterm-kitty`
+and `KITTY_WINDOW_ID` set), the picker has a near-black background, soft purple
+bloom around a square neon frame with straight 90-degree corners. Stationary
+sections brighten or dim at independently randomized times, without travelling
+waves or a global pulse. Each session has its own cached flicker pattern. The
+six-second animation runs inside Kitty at 30 FPS; the application uploads compressed
+frames for each window geometry and reuses cached assets. A background asset
+worker prepares the initial loop without blocking keyboard
+input; it never writes to the terminal. The main rendering lifecycle uploads
+frames incrementally, and Kitty owns playback. After loading, no per-frame
+Python redraw is needed.
+
+```bash
+uv sync --extra graphics
+uv run --extra graphics python cmdvault
+uv run --extra graphics python cmdvault --graphics-test
+uv run --extra graphics python cmdvault --glow 0.45 --fps 30
+uv run --extra graphics python cmdvault --no-animation
+cmdvault --graphics ansi
+```
+
+`./install.sh` uses uv when available to create an application-specific environment
+under `$XDG_DATA_HOME/cmdvault/app`, including optional Pillow. Without uv it
+installs a standard-library ANSI launcher and explains the missing dependency.
+No system Python packages are modified.
+
+Preferences are loaded from `$XDG_CONFIG_HOME/cmdvault/visuals.json` (default
+`~/.config/cmdvault/visuals.json`). CLI flags override them for one invocation:
+
+```json
+{"theme":"neon","renderer":"kitty","glow":0.45,"animation":true,"fps":30}
+```
+
+The default glow is 45%, with a narrower, softer halo. Existing configuration
+files retain their renderer, glow and FPS preferences. Pass `--glow 0.45` to
+override an older glow setting. Use
+`--fps 30` to override an older FPS setting; the cached animation period remains six seconds
+at every frame rate. To get Kitty,
+change `renderer` to `kitty` or pass `--graphics kitty`.
+
+### Rendering and fallbacks
+
+A PTY adapter keeps fzf responsible for searching and keyboard handling. One
+parent process serializes fzf output and graphics output; split VT sequences are
+tracked so graphics are never inserted in the middle of a child escape sequence.
+The picker reserves margins for the frame; its transparent center leaves text
+clear. Graphics, modes and cursor are cleaned up before executing commands or
+showing deletion confirmation. Window resize updates the child PTY, frame geometry and image placement.
+The frame preserves the terminal pixel aspect ratio using a uniformly downscaled
+raster (up to 480×320), with antialiased straight corners. Text uses fixed
+one-row/two-column insets shared with the border geometry. A positive Kitty z index is used only in the reserved
+margins so bloom remains visible with an opaque terminal background.
+
+Detection is passive and requires both Kitty session markers. tmux/screen,
+unverified terminals, missing Pillow, very small starting windows and non-TTY output use ANSI. No protocol
+queries consume user keystrokes. `--graphics auto` prioritizes Kitty when these
+conditions are met. SIXEL remains a separate static diagnostics backend and
+conservatively falls back to ANSI in the CLI; Kitty support does not imply SIXEL
+support. Non-TTY diagnostics emit plain text without terminal escape codes.
+
+Validation includes protocol unit tests and real fzf over a simulated terminal
+PTY. A real Kitty window still needs manual visual verification; a PTY test does
+not establish GPU rendering compatibility.
+
+Manual checks: run the graphics test, resize the picker, type a search and use
+arrow keys, save a disposable favorite with Ctrl-S/Alt-F, then verify Esc restores
+the previous screen. Use `--print` and a temporary history for Enter/deletion
+checks. Compare `--no-animation`, `--graphics ansi` and redirected diagnostics.
+
+Protocol reference: [Kitty graphics and animation specification](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
