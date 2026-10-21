@@ -3,9 +3,12 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 # Keep imports available without changing the user's Python environment.
 package_root="${XDG_DATA_HOME:-$HOME/.local/share}/cmdvault/app"
-install -d "$package_root/src/visuals"
+install -d "$package_root/src/visuals" "$package_root/src/sync" "$package_root/src/security"
 install -m755 cmdvault "$package_root/cmdvault"
 install -m644 src/visuals/*.py "$package_root/src/visuals/"
+install -m644 src/database.py src/models.py "$package_root/src/"
+install -m644 src/sync/*.py "$package_root/src/sync/"
+install -m644 src/security/*.py "$package_root/src/security/"
 python_executable=python3
 if command -v uv >/dev/null 2>&1; then
     install -m644 pyproject.toml uv.lock "$package_root/"

@@ -228,3 +228,114 @@ the previous screen. Use `--print` and a temporary history for Enter/deletion
 checks. Compare `--no-animation`, `--graphics ansi` and redirected diagnostics.
 
 Protocol reference: [Kitty graphics and animation specification](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
+
+## Cloud Sync foundation (local only)
+
+This phase adds **no cloud connection, account, authentication or remote API**.
+All existing search, execution, favorites, deletion, secret warnings, Bash hooks
+and Neon keyboard/UI behavior remain in place. No dependencies were added.
+
+The architecture inspected for this phase had no SQLite schema or tag UI:
+`cmdvault` reads Bash history directly and stores favorites in a JSON list;
+`src/app.py`, `database.py`, `models.py` and sync/security modules were placeholders.
+History and favorites have **not** been replaced with a new database format.
+
+### Files, migration and recovery
+
+`favorites.json` remains the source of truth for favorite membership and order.
+Its adjacent `favorites.sync.sqlite3` stores local record metadata, UUIDs, device
+identity, opaque cursor slots, tag relationships and a durable outbox. The default
+location is `$XDG_DATA_HOME/cmdvault/` or `~/.local/share/cmdvault/`. A custom
+`FavoritesBridge(path)` gets a sidecar next to that file, named after its stem.
+The installer includes the new Python modules in the installed application.
+
+On first access to existing favorites, commands are imported as **local-only**,
+without rewriting any JSON bytes or reading/copying Bash history into SQLite.
+A history-only browse with no favorites or sidecar creates neither file. Ordinary
+favorite writes still use the existing `.lock`, UTF-8 JSON format, mode `0600`,
+and atomic replacement. The sidecar is created with mode `0600` too.
+
+Migrations use a separate `cv_schema_migrations` ledger and `BEGIN IMMEDIATE`:
+
+| Version | Additions |
+| --- | --- |
+| 1 | Base `cv_records` table with preserved numeric IDs and JSON record data |
+| 2 | UUID backfill, eligibility/revision/tombstone columns, tag links, outbox, device/cursor state, recoverable favorite-write intent |
+
+These are the initial versions of the **new sidecar**, not an invented migration
+of a pre-existing application SQLite schema. Upgrading version 1 preserves IDs,
+payloads and timestamps, and adds UUIDs once. Reopening preserves those UUIDs.
+There are no table rebuilds or drops; unrelated tables and `PRAGMA user_version`
+are untouched. Migration errors roll back DDL and data together. Future versions
+and unrecognized conflicting tables fail closed rather than being rewritten.
+
+A favorite update commits its record changes, queue event and target JSON intent
+in one SQLite transaction before replacing JSON. On the next read/write, an
+interrupted replacement rolls forward; an already-completed replacement simply
+clears the intent. If another application edited JSON after the interruption,
+cmdvault refuses to overwrite it and retains both the JSON and pending target in
+`cv_favorites_intent`. Resolving that unusual conflict requires choosing which
+favorite list to retain; no automatic winner or secret-containing backup is made.
+Manual edits by older cmdvault versions are reconciled on next access when no
+unfinished intent conflicts with them.
+
+Bash history deletion retains its existing lock/atomic-replace implementation.
+History deletion and favorite deletion span different files and are not one
+transaction; a filesystem error can still produce the existing “partial” delete
+notice. A completed favorite/metadata operation does have durable recovery.
+
+### Records and offline queue
+
+`src.sync.store.LocalStore` exposes local command, tag and command-tag-link
+operations. Tags are a foundation API only; no tag UI or shortcuts were added.
+Each record has a stable UUID, revision, `local_only` / `sync_eligible` state,
+and optional deletion timestamp. New/imported records are always local-only.
+Sync eligibility requires an explicit API call and an injected `SecretScanner`
+whose result approves the payload. There is intentionally no production scanner
+or one-click sync enablement in this phase; existing CLI secret warnings are
+unchanged.
+
+An eligible mutation and its outbox event commit together. Events contain only
+UUID/revision/operation metadata, not duplicate command text. Multiple pending
+changes to one record coalesce to the latest revision. Each replacement gets a
+new event UUID, so acknowledging an old event cannot discard a later edit.
+Failed preparation keeps the event queued; retry counts use short error codes,
+not credential-bearing exception strings. No timer or background sync job runs.
+
+Deleting a record clears its payload and natural key and retains a UUID tombstone.
+Eligible records queue a delete; local-only deletes stay local. Command/tag
+removal tombstones dependent links first. Removing sync eligibility queues a
+remote-withdrawal delete while keeping the local content; eligible links are
+withdrawn with their parent. Re-adding deleted content creates a new UUID.
+Unfavoriting a tagged command preserves its local tag relationships, while the
+existing confirmed Ctrl-D operation removes the command and its relationships.
+Tombstones are not garbage-collected before a future sync policy exists.
+
+SQLite data is **not encrypted at rest** in this phase. Local favorites remain
+plaintext just as the JSON file is plaintext. Tombstones clear logical payloads;
+this is not secure erasure of SQLite pages, filesystem journals or backups.
+`src.security.crypto.PayloadCipher` and `src.security.secrets.SecretScanner`
+are explicit interfaces for the next phase. `prepare_change()` demonstrates
+scanner/encryption injection and revision-bound associated metadata, without
+sending anything or acknowledging the event. No identity/plaintext cipher is
+provided. Delete preparation contains identity metadata only, never old content.
+
+### Before the next phase
+
+Agree on the wire format and conflict/dependency ordering; implement authenticated
+client-side encryption (including tombstone metadata), key management and a real
+secret scanner; add account/transport logic and scoped atomic pull/cursor commits.
+Choose how a cloned/restored database receives a new device identity. Coordinate
+remote favorite updates through the JSON bridge rather than writing sidecar
+favorite flags directly. Decide tombstone retention/garbage collection and expose
+eligibility/conflict recovery through an explicit UI before enabling real sync.
+A device ID identifies this local database; it is not an account or credential.
+
+Run the offline migration/outbox/recovery tests and the existing regressions:
+
+```bash
+uv run --extra graphics python -m unittest discover -s tests -v
+```
+
+All sync tests use temporary files; socket creation is forbidden in the offline
+operation test. No test contacts a service or reads the user's stored history.

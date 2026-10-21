@@ -13,6 +13,7 @@ import sys
 import tempfile
 
 # The installer places the same package beside the executable.
+from src.sync.favorites import FavoritesBridge
 from src.visuals.config import VisualConfig
 from src.visuals.ansi import fzf_options
 from src.visuals.detector import detect, select
@@ -110,41 +111,11 @@ def favorites_path():
 
 
 def read_favorites(path):
-    if not path.exists():
-        return []
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, list) or any(
-        not isinstance(command, str) or not command.strip() or "\0" in command
-        for command in data
-    ):
-        raise ValueError(f"Invalid favorites file: {path}")
-    return list(dict.fromkeys(data))
+    return FavoritesBridge(path).read()
 
 
 def update_favorite(path, command, remove=False):
-    if not command.strip() or "\0" in command:
-        raise ValueError("A command must be nonempty and contain no NUL characters.")
-    # Lock a separate file because the JSON file is atomically replaced.
-    import fcntl
-
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lock_fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
-    with os.fdopen(lock_fd, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        commands = read_favorites(path)
-        if remove:
-            commands = [item for item in commands if item != command]
-        elif command not in commands:
-            commands.append(command)
-        fd, temporary = tempfile.mkstemp(prefix=".favorites-", dir=path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as output:
-                json.dump(commands, output, ensure_ascii=False, indent=2)
-                output.write("\n")
-            os.replace(temporary, path)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+    FavoritesBridge(path).update(command,remove=remove)
 
 
 def history_without(text, command):
@@ -204,10 +175,9 @@ def delete_history_command(path, command):
 def delete_entry(path, command):
     # Preflight favorites so malformed data is never silently discarded.
     favorite_file = favorites_path()
-    favorites = read_favorites(favorite_file)
+    read_favorites(favorite_file)
     count = delete_history_command(path, command)
-    if command in favorites:
-        update_favorite(favorite_file, command, remove=True)
+    FavoritesBridge(favorite_file).update(command,remove=True,delete_record=True)
     return count
 
 
