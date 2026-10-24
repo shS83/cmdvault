@@ -8,7 +8,8 @@ from rest_framework.views import APIView
 from devices.services import authorized
 from src.sync.protocol import SCHEMA_VERSION, validate_push
 from .models import ChangeLog, SyncRecord
-
+from django.db import transaction
+from django.contrib.auth import get_user_model
 
 class Conflict(APIException):
     status_code = 409
@@ -58,41 +59,99 @@ def receipt(change):
             "revision": change.revision, "sequence": change.sequence}
 
 
+
 class Push(APIView):
     def post(self, request):
         enabled()
+
         try:
             data = validate_push(request.data)
         except (ValueError, TypeError, AttributeError):
             raise ValidationError("invalid_push") from None
+
         results = []
+
         with authorized(request) as (owner, _):
-            sequence = head(owner)
-            for item in data["mutations"]:
-                digest = hashlib.sha256(json.dumps(item, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-                old = ChangeLog.objects.filter(owner=owner, change_id=item["change_id"]).first()
-                if old:
-                    if old.request_digest != digest:
-                        raise Conflict("change_id_reused")
-                    results.append(receipt(old))
-                    continue
-                record = SyncRecord.objects.filter(owner=owner, uuid=item["record_uuid"]).first()
-                revision = record.revision if record else 0
-                if item["base_revision"] != revision:
-                    raise Conflict({"code": "revision_conflict", "record_uuid": item["record_uuid"],
-                                    "current_revision": revision})
-                revision += 1
-                envelope = item["envelope"]
-                SyncRecord.objects.update_or_create(owner=owner, uuid=item["record_uuid"], defaults={
-                    "revision": revision, "deleted": item["operation"] == "delete",
-                    "encrypted_payload": envelope, "key_version": envelope["key_version"] if envelope else None})
-                sequence += 1
-                change = ChangeLog.objects.create(owner=owner, sequence=sequence, change_id=item["change_id"],
-                    request_digest=digest, record_uuid=item["record_uuid"], revision=revision,
-                    operation=item["operation"], encrypted_payload=envelope)
-                results.append(receipt(change))
-        # Do not advance the client's pull cursor on push: other devices' changes may be unseen.
-        return Response({"schema_version": SCHEMA_VERSION, "accepted": results})
+            with transaction.atomic():
+                # Serialize all pushes for this account.
+                get_user_model().objects.select_for_update().get(
+                    pk=owner.pk
+                )
+
+                sequence = head(owner)
+
+                for item in data["mutations"]:
+                    digest = hashlib.sha256(
+                        json.dumps(
+                            item,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest()
+
+                    old = ChangeLog.objects.filter(
+                        owner=owner,
+                        change_id=item["change_id"],
+                    ).first()
+
+                    if old:
+                        if old.request_digest != digest:
+                            raise Conflict("change_id_reused")
+
+                        results.append(receipt(old))
+                        continue
+
+                    record = SyncRecord.objects.filter(
+                        owner=owner,
+                        uuid=item["record_uuid"],
+                    ).first()
+
+                    revision = record.revision if record else 0
+
+                    if item["base_revision"] != revision:
+                        raise Conflict({
+                            "code": "revision_conflict",
+                            "record_uuid": item["record_uuid"],
+                            "current_revision": revision,
+                        })
+
+                    revision += 1
+                    envelope = item["envelope"]
+
+                    SyncRecord.objects.update_or_create(
+                        owner=owner,
+                        uuid=item["record_uuid"],
+                        defaults={
+                            "revision": revision,
+                            "deleted": item["operation"] == "delete",
+                            "encrypted_payload": envelope,
+                            "key_version": (
+                                envelope["key_version"]
+                                if envelope else None
+                            ),
+                        },
+                    )
+
+                    sequence += 1
+
+                    change = ChangeLog.objects.create(
+                        owner=owner,
+                        sequence=sequence,
+                        change_id=item["change_id"],
+                        request_digest=digest,
+                        record_uuid=item["record_uuid"],
+                        revision=revision,
+                        operation=item["operation"],
+                        encrypted_payload=envelope,
+                    )
+
+                    results.append(receipt(change))
+
+        return Response({
+            "schema_version": SCHEMA_VERSION,
+            "accepted": results,
+        })
+
 
 
 class Pull(APIView):
