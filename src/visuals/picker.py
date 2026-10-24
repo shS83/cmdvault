@@ -93,6 +93,77 @@ def pulse_label_packet(columns: int, rows: int, label: str, *, pixel_width: int 
             '\x1b[0m\x1b8')
 
 
+HELP_LINES = (
+    "ENTER       Run or select the highlighted command",
+    "CTRL-S      Save favorite (stay in picker)",
+    "ALT-F       Save favorite (alternative shortcut)",
+    "CTRL-D      Permanently delete selected command",
+    "CTRL-Y      Copy selected command",
+    "CTRL-R      Check Cloud Sync service status",
+    "RIGHT       Show full command preview",
+    "LEFT        Close command preview",
+    "CTRL-H      Open / close this help",
+    "ESC         Cancel picker / close help",
+)
+
+
+def top_banner_packet(columns: int, rows: int, version: str) -> str:
+    """Draw text in fzf's deliberately reserved top margin."""
+    if columns < 40 or rows < 14:
+        return ''
+    left = f"CMDVAULT v{version}"
+    right = "CTRL-H for help"
+    inner = max(0, columns - 8)
+    left = left[:max(0, inner - len(right) - 2)]
+    gap = max(2, inner - len(left) - len(right))
+    header = (left + ' ' * gap + right)[:inner]
+    return ('\x1b7\x1b[48;2;11;8;18m\x1b[38;2;195;150;245m'
+            + f'\x1b[2;5H{header}'
+            + f'\x1b[3;5H' + '─' * inner
+            + '\x1b[0m\x1b8')
+
+
+def help_modal_packet(columns: int, rows: int, enter_action: str = 'run') -> str:
+    """Centered, opaque text dialog: no network calls or history access."""
+    if columns < 50 or rows < 18:
+        return ''
+    width = min(66, columns - 8)
+    height = len(HELP_LINES) + 6
+    top = max(1, (rows - height) // 2 + 1)
+    left = max(1, (columns - width) // 2 + 1)
+    bg = '\x1b[48;2;17;13;27m'
+    fg = '\x1b[38;2;229;217;245m'
+    purple = '\x1b[38;2;179;92;255m'
+    def line(y: int, value: str, *, accent=False) -> str:
+        # All border glyphs are single-cell Unicode box-drawing characters.
+        # Keep width measured in terminal cells; do not use ASCII +---+.
+        return (f'\x1b[{y};{left}H' + bg + (purple if accent else fg)
+                + value.ljust(width)[:width])
+
+    def framed(text: str = "") -> str:
+        usable = width - 4
+        return "│ " + text[:usable].ljust(usable) + " │"
+
+    content = [
+        "╭" + "─" * (width - 2) + "╮",
+        framed("CMDVAULT  ·  KEYBOARD HELP"),
+        "├" + "─" * (width - 2) + "┤",
+    ]
+    for value in HELP_LINES:
+        if value.startswith('ENTER'):
+            value = value.replace('Run or select', enter_action.capitalize() + ' or select', 1)
+        content.append(framed(value))
+    content.extend([
+        framed(),
+        framed("ESC / ENTER / CTRL-H  ·  CLOSE"),
+        "╰" + "─" * (width - 2) + "╯",
+    ])
+    return ('\x1b7' + ''.join(line(top + i, value,
+            accent=i in (0, 1, 2, len(content) - 1))
+            for i, value in enumerate(content)) + '\x1b[0m\x1b8')
+
+
+
 class EscapeBoundary:
     """Track split VT sequences so graphics never interrupt a child sequence."""
     def __init__(self):
@@ -176,6 +247,10 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
     animation_geometry = None
     pulse_geometry = None
     pulse_needs_draw = True
+    help_visible = False
+    heading_version = env.get("CMDVAULT_VERSION", "0.1.7")
+    enter_action = env.get("CMDVAULT_ENTER_ACTION", "run")
+    heading_dirty = True
 
     def resize_signal(signum, frame):
         nonlocal resized
@@ -195,7 +270,7 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
         return max(1,columns),max(1,rows),xp,yp
 
     def emit(value):
-        write_all(terminal,value.encode('ascii'))
+        write_all(terminal,value.encode('utf-8'))
 
     try:
         columns, rows, xp, yp = geometry()
@@ -226,13 +301,30 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                     upload = decoration.upload(xp or columns*8,yp or rows*16,columns,rows,animate=False) or upload
                     ready_to_place = True
                     pulse_needs_draw = True
+                    heading_dirty = True
                 readable,_,_ = select.select([terminal,master],[],[],
                     .02 if loader and not loader.done.is_set() else .05 if ready_to_place else .25)
                 if terminal in readable:
                     keys = os.read(terminal,65536)
                     if not keys:
                         break
-                    write_all(master,keys)
+                    if help_visible:
+                        # A dismissal key refreshes fzf; do not feed it to search.
+                        if keys:
+                            help_visible = False
+                            write_all(master, b'\x0c')  # fzf redraw-screen
+                            heading_dirty = True
+                            pulse_needs_draw = True
+                            ready_to_place = True
+                            last_output = time.monotonic()
+                    elif b'\x08' in keys:
+                        prefix, _, _suffix = keys.partition(b'\x08')
+                        if prefix:
+                            write_all(master, prefix)
+                        help_visible = True
+                        emit(help_modal_packet(columns, rows, enter_action))
+                    else:
+                        write_all(master,keys)
                 if master in readable:
                     try:
                         data = os.read(master,65536)
@@ -242,7 +334,8 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                         break
                     if not data:
                         break
-                    write_all(terminal,data)
+                    if not help_visible:
+                        write_all(terminal,data)
                     previous_erasures = boundary.erasures
                     boundary.feed(data)
                     # Re-place after erasure / alternate screen changes. Upload
@@ -254,7 +347,7 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                         pulse_needs_draw = True
                     ready_to_place = True
                     last_output = time.monotonic()
-                if ready_to_place and boundary.safe and time.monotonic()-last_output >= .025:
+                if ready_to_place and not help_visible and boundary.safe and time.monotonic()-last_output >= .025:
                     geometry_key = (columns,rows,xp,yp)
                     if upload or geometry_key != animation_geometry:
                         if loader:
@@ -269,9 +362,13 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                     pulse_needs_draw = True
                     upload = ''
                     ready_to_place = False
-                if loader and boundary.safe and not upload:
+                    heading_dirty = True
+                if loader and boundary.safe and not upload and not help_visible:
                     emit(loader.drain())
-                if boundary.safe and not ready_to_place and not upload:
+                if not help_visible and boundary.safe and not ready_to_place and not upload:
+                    if heading_dirty:
+                        emit(top_banner_packet(columns, rows, heading_version))
+                        heading_dirty = False
                     location = (columns, rows, xp, yp)
                     if location != pulse_geometry:
                         pulse_needs_draw = True

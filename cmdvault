@@ -191,6 +191,28 @@ def pick(entries, query, favorites_only, enter_action="run", history_path=None):
                          Path(folder) / 'position')
 
 
+def sync_readiness_notice():
+    """Read-only Ctrl-R check. Never reads or transmits Bash history."""
+    from src.sync.auth import CredentialError, load_credential
+    from src.sync.client import SyncAPI, SyncHTTPError
+
+    try:
+        credential = load_credential()
+        if credential is None or credential.is_expired():
+            return "\nCloud Sync: LOGIN REQUIRED (cmdvault sync login)."
+        with SyncAPI(token=credential.token) as api:
+            status = api.status()
+        if not status["sync_enabled"]:
+            return "\nCloud Sync: DISABLED on server."
+        return "\nCloud Sync: READY (server reachable; history sync not yet implemented)."
+    except SyncHTTPError as exc:
+        if exc.code == "offline":
+            return "\nCloud Sync: OFFLINE."
+        return "\nCloud Sync: ERROR (" + exc.code + ")."
+    except (CredentialError, OSError, ValueError):
+        return "\nCloud Sync: ERROR (local credentials)."
+
+
 def pick_loop(entries, query, favorites_only, enter_action, history_path, position_path):
     fzf = shutil.which("fzf")
     if not fzf:
@@ -199,6 +221,8 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
     env.pop("FZF_DEFAULT_OPTS", None)
     env.pop("FZF_DEFAULT_OPTS_FILE", None)
     env['CMDVAULT_POSITION_FILE'] = str(position_path)
+    env['CMDVAULT_VERSION'] = VERSION
+    env['CMDVAULT_ENTER_ACTION'] = enter_action
     position = 1
     caps = detect(sys.stderr)
     backend, fallback_notice = select(_VISUAL_CONFIG.renderer, caps, raster_layout=True)
@@ -217,7 +241,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
     def invoke(argv, **kwargs):
         if neon_picker:
             argv = [arg for arg in argv if not arg.startswith(("--height=", "--border=", "--border-label="))]
-            argv += ["--no-clear", "--height=100%", "--border=none", "--margin=1,2"]
+            argv += ["--no-clear", "--height=100%", "--border=none", "--margin=3,0,0,0"]
             return run_picker(argv, input=kwargs["input"], env=kwargs["env"], config=_VISUAL_CONFIG)
         return subprocess.run(argv, **kwargs)
     notice = ""
@@ -226,14 +250,13 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
         warnings = sum(bool(entry.secrets) for entry in entries)
         result = invoke(
             [fzf, *fzf_options(detect(sys.stderr).truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--no-multi", "--layout=reverse",
-             "--padding=0,3,0,3", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
+             "--padding=0,3,0,2", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
              "--border-label= CMDVAULT / " + ("FAVORITES " if favorites_only else "HISTORY "),
-             "--header=ENTER " + enter_action + " · CTRL-S / ALT-F save favorite (stay open) · CTRL-D delete permanently · CTRL-Y copy · ESC cancel" +
-             f"\n{warnings} possible secret(s): red rows first. Review and use CTRL-D to remove." + notice,
+             "--header=" + f"{warnings} possible secret(s): red rows first. Review and use CTRL-D to remove." + notice,
              "--sync", "--with-shell=bash -c",
              "--bind=result:last+pos(" + str(position) + ")+unbind(result)",
              '--bind=focus:execute-silent(printf "%s" "$FZF_POS" > "$CMDVAULT_POSITION_FILE")',
-             "--expect=ctrl-s,alt-f,ctrl-y,ctrl-d", "--query=" + query],
+             "--expect=ctrl-s,alt-f,ctrl-y,ctrl-d,ctrl-r", "--query=" + query],
             input=rows, capture_output=True, text=True, env=env,
         )
         if result.returncode in (1, 130):
@@ -241,9 +264,12 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
         if result.returncode:
             raise ValueError("fzf failed: " + result.stderr.strip())
         lines = result.stdout.splitlines()
-        if len(lines) != 3 or lines[1] not in ("", "ctrl-s", "alt-f", "ctrl-y", "ctrl-d"):
+        if len(lines) != 3 or lines[1] not in ("", "ctrl-s", "alt-f", "ctrl-y", "ctrl-d", "ctrl-r"):
             raise ValueError("Invalid picker output.")
         query, key, row = lines
+        if key == "ctrl-r":
+            notice = sync_readiness_notice()
+            continue
         try:
             index = int(row.split("\t", 1)[0])
             if not 0 <= index < len(entries):
