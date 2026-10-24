@@ -1,0 +1,523 @@
+#!/usr/bin/env python3
+"""Find and keep useful commands from your own Bash history."""
+
+import argparse
+from dataclasses import dataclass, field
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# The installer places the same package beside the executable.
+from src.sync.favorites import FavoritesBridge
+from src.visuals.config import VisualConfig
+from src.visuals.ansi import fzf_options
+from src.visuals.detector import detect, select
+from src.visuals.diagnostics import run as graphics_test
+from src.visuals.picker import run_picker
+
+_VISUAL_CONFIG = VisualConfig()
+
+VERSION = "0.1.7"
+
+# Require data fields as well as a prefix: documentation mentioning "$6$"
+# or shell references such as "$6" alone should not trigger a warning.
+from src.security.secrets import PRIVATE_KEY, secret_reasons
+
+
+@dataclass
+class Entry:
+    command: str
+    count: int = 0
+    recent: int = -1
+    favorite: bool = False
+    priority: int | None = None
+    secrets: tuple = field(init=False)
+
+    def __post_init__(self):
+        self.secrets = secret_reasons(self.command)
+
+
+def history_commands(text):
+    """Timestamped Bash entries preserve literal multiline commands."""
+    pending = None
+    for line in text.splitlines():
+        if re.fullmatch(r"#[0-9]+", line):
+            if pending is not None:
+                command = "\n".join(pending)
+                if command.strip():
+                    yield command
+            pending = []
+        elif pending is not None:
+            pending.append(line)
+        elif line.strip():
+            yield line
+    if pending is not None:
+        command = "\n".join(pending)
+        if command.strip():
+            yield command
+
+
+def favorites_path():
+    root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    return root / "cmdvault/favorites.json"
+
+
+def priority_path():
+    return favorites_path().with_name("favorites.priority.json")
+
+
+def read_priorities():
+    path = priority_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    if not isinstance(data, list) or any(not isinstance(x, str) for x in data):
+        raise ValueError("Invalid priority favorites file")
+    return list(dict.fromkeys(data))
+
+
+def write_priorities(items):
+    # Atomic replacement; keep a separate ordering file, preserving favorites.json.
+    path = priority_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(prefix=".priority-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(items, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def toggle_priority_favorite(command):
+    """Promote to priority, or demote to an ordinary favorite."""
+    priorities = read_priorities()
+    if command in priorities:
+        write_priorities([x for x in priorities if x != command])
+        return False
+    # Persist favorite before publishing the priority marker.
+    if command not in read_favorites(favorites_path()):
+        update_favorite(favorites_path(), command)
+    write_priorities([command, *(x for x in priorities if x != command)])
+    return True
+
+
+def toggle_favorite(command):
+    """Add an ordinary favorite; remove existing favorite and priority together."""
+    path = favorites_path()
+    if command in read_favorites(path):
+        update_favorite(path, command, remove=True)
+        priorities = read_priorities()
+        if command in priorities:
+            write_priorities([x for x in priorities if x != command])
+        return False
+    update_favorite(path, command)
+    return True
+
+
+def reorder_priority(command, direction):
+    priorities = read_priorities()
+    if command not in priorities:
+        return False
+    i = priorities.index(command)
+    j = i + direction
+    if not 0 <= j < len(priorities):
+        return False
+    priorities[i], priorities[j] = priorities[j], priorities[i]
+    write_priorities(priorities)
+    return True
+
+
+def read_favorites(path):
+    return FavoritesBridge(path).read()
+
+
+def update_favorite(path, command, remove=False):
+    FavoritesBridge(path).update(command,remove=remove)
+
+
+def history_without(text, command):
+    """Remove exact logical entries, preserving untouched bytes and timestamps."""
+    blocks = []
+    pending = None
+    for line in text.splitlines(keepends=True):
+        if re.fullmatch(r"#[0-9]+", line.rstrip("\r\n")):
+            if pending is not None:
+                blocks.append(pending)
+            pending = [line]
+        elif pending is not None:
+            pending.append(line)
+        else:
+            blocks.append([line])
+    if pending is not None:
+        blocks.append(pending)
+    kept = []
+    removed = 0
+    for block in blocks:
+        body = block[1:] if re.fullmatch(r"#[0-9]+", block[0].rstrip("\r\n")) else block
+        value = "\n".join(line.rstrip("\r\n") for line in body)
+        if value == command:
+            removed += 1
+        else:
+            kept.extend(block)
+    return "".join(kept), removed
+
+
+def delete_history_command(path, command):
+    """Delete all exact matches without creating a backup containing the secret."""
+    import fcntl
+    path = path.expanduser().resolve()
+    if not path.exists():
+        return 0
+    with open(str(path) + ".cmdvault.lock", "a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        original = path.read_bytes()
+        cleaned, removed = history_without(original.decode("utf-8"), command)
+        if not removed:
+            return 0
+        fd, temporary = tempfile.mkstemp(prefix=".cmdvault-history-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                output.write(cleaned.encode("utf-8"))
+                output.flush()
+                os.fsync(output.fileno())
+            if path.read_bytes() != original:
+                raise ValueError("History changed during deletion; retry.")
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    return removed
+
+
+def delete_entry(path, command):
+    # Preflight favorites so malformed data is never silently discarded.
+    favorite_file = favorites_path()
+    read_favorites(favorite_file)
+    count = delete_history_command(path, command)
+    FavoritesBridge(favorite_file).update(command,remove=True,delete_record=True)
+    return count
+
+
+def entries_from(history, favorites):
+    entries = {}
+    in_private_key = False
+    for index, command in enumerate(history_commands(history)):
+        if "\0" in command:
+            continue
+        entry = entries.setdefault(command, Entry(command))
+        # Untimestamped history represents a pasted PEM block as separate rows.
+        # Carry the warning only across contiguous key body/footer lines.
+        stripped = command.strip()
+        if in_private_key:
+            if re.fullmatch(r'[A-Za-z0-9+/=]{16,}', stripped) or re.fullmatch(
+                    r'-----END (?:OPENSSH |RSA |EC |DSA |ENCRYPTED )?PRIVATE KEY-----', stripped):
+                entry.secrets = tuple(dict.fromkeys((*entry.secrets, 'private key fragment')))
+            else:
+                in_private_key = False
+        if PRIVATE_KEY.fullmatch(stripped):
+            in_private_key = True
+        elif stripped.startswith('-----END '):
+            in_private_key = False
+        entry.count += 1
+        entry.recent = index
+    for command in favorites:
+        entries.setdefault(command, Entry(command)).favorite = True
+    priority_index = {command: n for n, command in enumerate(read_priorities())}
+    for command, entry in entries.items():
+        if entry.favorite and command in priority_index:
+            entry.priority = priority_index[command]
+    return sorted(entries.values(), key=lambda e: (
+        0 if e.priority is not None else 1 if e.favorite else 2,
+        e.priority if e.priority is not None else 0,
+        -e.recent,
+    ))
+
+
+def display(command):
+    # Escape control characters in the picker without changing the saved command.
+    return json.dumps(command, ensure_ascii=False)[1:-1]
+
+
+def entries_from_current(entries):
+    indices = {value: index for index, value in enumerate(read_priorities())}
+    for entry in entries:
+        entry.priority = indices.get(entry.command) if entry.favorite else None
+    return sorted(entries, key=lambda e: (0 if e.priority is not None else 1 if e.favorite else 2,
+                                            e.priority if e.priority is not None else 0, -e.recent))
+
+
+def entry_row(index, entry):
+    color = '\x1b[31m' if entry.secrets else '\x1b[32m' if entry.priority is not None else '\x1b[33m' if entry.favorite else ''
+    warning = '[POSSIBLE SECRET: ' + ', '.join(entry.secrets) + '] ' if entry.secrets else ''
+    return (f'{index}\t{color}{warning}' +
+            f"{'◆' if entry.priority is not None else '★' if entry.favorite else '·'}  {entry.count:>4}x  {display(entry.command)}" +
+            ('\x1b[0m' if color else '') + '\n')
+
+
+def confirm_delete(command, terminal="/dev/tty"):
+    """Ask on the terminal, never consume piped input or emit executable output."""
+    with open(terminal, 'w', encoding='utf-8') as output, open(terminal, 'r', encoding='utf-8') as source:
+        output.write(f'Deleting {display(command)}, are you sure? y/n [n]: ')
+        output.flush()
+        return source.readline().strip().lower() == 'y'
+
+
+def pick(entries, query, favorites_only, enter_action="run", history_path=None):
+    with tempfile.TemporaryDirectory(prefix='cmdvault-picker-') as folder:
+        return pick_loop(entries, query, favorites_only, enter_action, history_path,
+                         Path(folder) / 'position')
+
+
+def pick_loop(entries, query, favorites_only, enter_action, history_path, position_path):
+    fzf = shutil.which("fzf")
+    if not fzf:
+        raise ValueError("fzf is required for the picker. Install it or use --list.")
+    env = os.environ.copy()
+    env.pop("FZF_DEFAULT_OPTS", None)
+    env.pop("FZF_DEFAULT_OPTS_FILE", None)
+    env['CMDVAULT_POSITION_FILE'] = str(position_path)
+    position = 1
+    caps = detect(sys.stderr)
+    backend, fallback_notice = select(_VISUAL_CONFIG.renderer, caps, raster_layout=True)
+    if backend == "kitty":
+        try:
+            import PIL
+        except ImportError:
+            backend = "ansi"
+            fallback_notice = "Kitty graphics needs Pillow: uv sync --extra graphics; using ANSI."
+    if fallback_notice:
+        print("cmdvault: " + fallback_notice, file=sys.stderr)
+    neon_picker = backend == "kitty" and sys.stdin.isatty()
+    if neon_picker:
+        dimensions = shutil.get_terminal_size((80, 24))
+        neon_picker = dimensions.columns >= 32 and dimensions.lines >= 10
+    def invoke(argv, **kwargs):
+        if neon_picker:
+            argv = [arg for arg in argv if not arg.startswith(("--height=", "--border=", "--border-label="))]
+            argv += ["--no-clear", "--height=100%", "--border=none", "--margin=1,2"]
+            return run_picker(argv, input=kwargs["input"], env=kwargs["env"], config=_VISUAL_CONFIG)
+        return subprocess.run(argv, **kwargs)
+    notice = ""
+    view = "favorites" if favorites_only else "local"
+    while True:
+        visible = [entry for entry in entries if view != "favorites" or entry.favorite]
+        rows = ''.join(entry_row(index, entry) for index, entry in enumerate(entries) if entry in visible)
+        warnings = sum(bool(entry.secrets) for entry in entries)
+        # Errors too long for the bottom status area open a readable dialog.
+        # Keep the short status string, never truncate the actual message.
+        message = notice.strip()
+        modal = message.lower().startswith(("error", "cloud sync: error", "save failed", "deletion failed")) and len(message) > 65
+        env.pop("CMDVAULT_ERROR_MODAL", None)
+        if modal and neon_picker:
+            env["CMDVAULT_ERROR_MODAL"] = message
+        visible_notice = ("\nError — see dialog (ESC to close)." if modal and neon_picker else notice)
+        result = invoke(
+            [fzf, *fzf_options(detect(sys.stderr).truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--no-multi", "--layout=reverse",
+             "--padding=0,3,0,3", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
+             "--border-label= CMDVAULT / " + view.upper() + " ",
+             "--header=CTRL-G GLOBAL · CTRL-F FAVORITES · CTRL-L LOCAL · CTRL-P PRIORITY · ALT-↑/↓ REORDER · CTRL-H HELP" +
+             f"\n{warnings} possible secret(s): red rows first. Review and use CTRL-D to remove." + visible_notice,
+             "--sync", "--with-shell=bash -c",
+             "--bind=result:last+pos(" + str(position) + ")+unbind(result)",
+             '--bind=focus:execute-silent(printf "%s" "$FZF_POS" > "$CMDVAULT_POSITION_FILE")',
+             "--expect=ctrl-s,alt-f,ctrl-y,ctrl-d,ctrl-g,ctrl-f,ctrl-l,ctrl-p,alt-up,alt-down", "--query=" + query],
+            input=rows, capture_output=True, text=True, env=env,
+        )
+        if result.returncode in (1, 130):
+            return None
+        if result.returncode:
+            raise ValueError("fzf failed: " + result.stderr.strip())
+        lines = result.stdout.splitlines()
+        if len(lines) != 3 or lines[1] not in ("", "ctrl-s", "alt-f", "ctrl-y", "ctrl-d", "ctrl-g", "ctrl-f", "ctrl-l", "ctrl-p", "alt-up", "alt-down"):
+            raise ValueError("Invalid picker output.")
+        query, key, row = lines
+        if key in ("ctrl-g", "ctrl-f", "ctrl-l"):
+            view = {"ctrl-g": "global", "ctrl-f": "favorites", "ctrl-l": "local"}[key]
+            notice = "\nGLOBAL currently uses local history; remote history is not imported yet." if view == "global" else ""
+            position = 1
+            continue
+        try:
+            index = int(row.split("\t", 1)[0])
+            if not 0 <= index < len(entries):
+                raise ValueError
+        except ValueError:
+            raise ValueError("Invalid picker selection.") from None
+        try:
+            position = max(1, int(position_path.read_text(encoding='utf-8')))
+        except (OSError, ValueError):
+            position = index + 1
+        if key == "ctrl-p":
+            try:
+                promoted = toggle_priority_favorite(entries[index].command)
+                entries[index].favorite = True
+                entries[:] = entries_from_current(entries)
+                notice = "\n◆ Priority favorite enabled." if promoted else "\n★ Priority removed; ordinary favorite retained."
+            except (OSError, ValueError) as error:
+                notice = "\nPriority save failed: " + display(str(error))
+            continue
+        if key in ("alt-up", "alt-down"):
+            if reorder_priority(entries[index].command, -1 if key == "alt-up" else 1):
+                entries[:] = entries_from_current(entries)
+                notice = "\nPriority order updated."
+            continue
+        if key == "ctrl-d":
+            try:
+                if not confirm_delete(entries[index].command):
+                    notice = "\nDeletion cancelled."
+                    continue
+                target = history_path or Path(os.environ.get("HISTFILE") or Path.home() / ".bash_history")
+                count = delete_entry(target, entries[index].command)
+            except (OSError, ValueError):
+                notice = "\nDeletion failed or was partial. Reload history and check file permissions; the command was not printed."
+            else:
+                entries.pop(index)
+                notice = f"\nDeleted {count} history occurrence(s) and removed the favorite."
+                if not entries:
+                    print("cmdvault: Selected command deleted; no entries remain.", file=sys.stderr)
+                    return None
+            continue
+        if key not in ("ctrl-s", "alt-f"):
+            return key, entries[index].command
+        try:
+            added = toggle_favorite(entries[index].command)
+        except (OSError, ValueError) as error:
+            notice = "\nFavorite update failed: " + display(str(error))
+        else:
+            entries[index].favorite = added
+            entries[:] = entries_from_current(entries)
+            notice = "\n★ Favorite enabled." if added else "\nFavorite removed (and priority cleared)."
+        # Preserve ordering for this picker session, including filtered results.
+
+
+def copy_command(command, functions_file=None, terminal="/dev/tty"):
+    functions_file = functions_file or Path.home() / ".functions"
+    if not Path(functions_file).is_file():
+        raise ValueError(f"Copy function file not found: {functions_file}")
+    try:
+        with open(terminal, "w", encoding="utf-8") as output:
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-c",
+                 'source "$1" || exit; declare -F copy >/dev/null || exit 127; copy',
+                 "cmdvault-copy", str(functions_file)],
+                input=command, text=True, stdout=output, stderr=subprocess.PIPE,
+            )
+    except OSError as error:
+        raise ValueError(f"Cannot access the terminal for copy(): {error}") from error
+    if result.returncode:
+        raise ValueError("copy() failed: " + (result.stderr.strip() or "check ~/.functions"))
+
+
+def execute_command(command):
+    """Replace cmdvault with Bash, retaining the terminal, cwd and environment."""
+    bash = shutil.which("bash")
+    if not bash:
+        raise ValueError("Bash is required to execute commands.")
+    # Interactive startup loads the user's aliases/functions from ~/.bashrc.
+    # The original command is one argv element, never reconstructed from display text.
+    os.execv(bash, [bash, "--noprofile", "-ic", command])
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # The Bash wrapper inserts --shell-output before the actual user arguments.
+    # Sync commands never write a shell selection, so dispatch them first.
+    sync_argv = argv[2:] if len(argv) >= 3 and argv[0] == "--shell-output" else argv
+    if sync_argv[:1] == ["sync"]:
+        from src.sync.cli import main as sync_main
+        return sync_main(sync_argv[1:])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("query", nargs="*", help="initial fzf search; substring filter with --list")
+    parser.add_argument("--version", action="version", version=f"cmdvault {VERSION}")
+    parser.add_argument("--history", type=Path,
+                        default=Path(os.environ.get("HISTFILE") or Path.home() / ".bash_history"),
+                        help="Bash history file (default: HISTFILE or ~/.bash_history)")
+    parser.add_argument("--favorites", action="store_true", help="show only saved commands")
+    parser.add_argument("--shell-output", type=Path, help=argparse.SUPPRESS)
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--list", action="store_true", help="print commands without fzf")
+    actions.add_argument("--print", dest="print_only", action="store_true", help="print the selection instead of running it")
+    actions.add_argument("--copy", action="store_true", help="copy the selected command")
+    actions.add_argument("--add", metavar="COMMAND", help="save an exact command as a favorite")
+    actions.add_argument("--remove", metavar="COMMAND", help="remove an exact favorite")
+    parser.add_argument("--theme", choices=["neon"], default=None)
+    parser.add_argument("--graphics", choices=["auto", "kitty", "sixel", "ansi"], default=None)
+    parser.add_argument("--glow", type=float, default=None)
+    parser.add_argument("--fps", type=int, default=None, help="animation target FPS (1..30; default 30)")
+    parser.add_argument("--no-animation", action="store_true")
+    parser.add_argument("--graphics-test", action="store_true")
+    args = parser.parse_args(argv)
+    global _VISUAL_CONFIG
+    stored = VisualConfig.load()
+    _VISUAL_CONFIG = VisualConfig(
+        theme=args.theme or stored.theme, renderer=args.graphics or stored.renderer,
+        glow=stored.glow if args.glow is None else args.glow,
+        animation=stored.animation and not args.no_animation, fps=stored.fps if args.fps is None else args.fps)
+    if args.graphics_test:
+        return graphics_test(_VISUAL_CONFIG, sys.stderr)
+    if (args.add is not None or args.remove is not None) and args.query:
+        parser.error("--add and --remove take one quoted command, without search terms")
+    path = favorites_path()
+    if args.add is not None or args.remove is not None:
+        update_favorite(path, args.add if args.add is not None else args.remove,
+                        remove=args.remove is not None)
+        print("cmdvault: Favorite " + ("removed." if args.remove is not None else "saved."), file=sys.stderr)
+        return 0
+    favorites = read_favorites(path)
+    history = ""
+    if not args.favorites:
+        try:
+            history = args.history.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            print(f"cmdvault: History file not found: {args.history}", file=sys.stderr)
+    entries = entries_from(history, favorites)
+    query = " ".join(args.query)
+    if args.list:
+        for entry in entries:
+            if query.casefold() in entry.command.casefold():
+                print(entry.command)
+        return 0
+    if not entries:
+        print(f"cmdvault: No commands found. Favorites file: {path}. Save with Ctrl-S / Alt-F or --add; Ctrl-Y only copies.", file=sys.stderr)
+        return 1
+    selected = pick(entries, query, args.favorites, "copy" if args.copy else "print" if args.print_only else "run", args.history)
+    if selected is None:
+        return 1
+    key, command = selected
+    if key == "ctrl-y" or args.copy:
+        try:
+            copy_command(command)
+        except ValueError:
+            print(command)
+            raise
+        print("cmdvault: Sent to copy().", file=sys.stderr)
+    elif args.print_only:
+        print(command)
+    elif args.shell_output is not None:
+        # A private file separates executable selections from all normal output,
+        # including --list, --print and clipboard failure diagnostics.
+        args.shell_output.write_bytes(command.encode('utf-8') + b'\x00')
+    else:
+        execute_command(command)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError) as error:
+        print(f"cmdvault: {error}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

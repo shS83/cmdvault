@@ -1,0 +1,174 @@
+--- /mnt/data/cmdvault-error-modal-fix/cmdvault	2026-10-24 08:34:56.073707149 +0000
++++ cmdvault	2026-10-24 09:01:11.466090139 +0000
+@@ -35,6 +35,7 @@
+     count: int = 0
+     recent: int = -1
+     favorite: bool = False
++    priority: int | None = None
+     secrets: tuple = field(init=False)
+ 
+     def __post_init__(self):
+@@ -66,6 +67,58 @@
+     return root / "cmdvault/favorites.json"
+ 
+ 
++def priority_path():
++    return favorites_path().with_name("favorites.priority.json")
++
++
++def read_priorities():
++    path = priority_path()
++    try:
++        data = json.loads(path.read_text(encoding="utf-8"))
++    except FileNotFoundError:
++        return []
++    if not isinstance(data, list) or any(not isinstance(x, str) for x in data):
++        raise ValueError("Invalid priority favorites file")
++    return list(dict.fromkeys(data))
++
++
++def write_priorities(items):
++    # Atomic replacement; keep a separate ordering file, preserving favorites.json.
++    path = priority_path()
++    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++    fd, temporary = tempfile.mkstemp(prefix=".priority-", dir=path.parent)
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as output:
++            json.dump(items, output, ensure_ascii=False, indent=2)
++            output.write("\n")
++            output.flush()
++            os.fsync(output.fileno())
++        os.chmod(temporary, 0o600)
++        os.replace(temporary, path)
++    finally:
++        if os.path.exists(temporary):
++            os.unlink(temporary)
++
++
++def prioritize_favorite(command):
++    update_favorite(favorites_path(), command)
++    priorities = read_priorities()
++    write_priorities([command, *(x for x in priorities if x != command)])
++
++
++def reorder_priority(command, direction):
++    priorities = read_priorities()
++    if command not in priorities:
++        return False
++    i = priorities.index(command)
++    j = i + direction
++    if not 0 <= j < len(priorities):
++        return False
++    priorities[i], priorities[j] = priorities[j], priorities[i]
++    write_priorities(priorities)
++    return True
++
++
+ def read_favorites(path):
+     return FavoritesBridge(path).read()
+ 
+@@ -161,7 +214,15 @@
+         entry.recent = index
+     for command in favorites:
+         entries.setdefault(command, Entry(command)).favorite = True
+-    return sorted(entries.values(), key=lambda entry: (bool(entry.secrets), entry.favorite, entry.recent), reverse=True)
++    priority_index = {command: n for n, command in enumerate(read_priorities())}
++    for command, entry in entries.items():
++        if entry.favorite and command in priority_index:
++            entry.priority = priority_index[command]
++    return sorted(entries.values(), key=lambda e: (
++        0 if e.priority is not None else 1 if e.favorite else 2,
++        e.priority if e.priority is not None else 0,
++        -e.recent,
++    ))
+ 
+ 
+ def display(command):
+@@ -169,11 +230,19 @@
+     return json.dumps(command, ensure_ascii=False)[1:-1]
+ 
+ 
++def entries_from_current(entries):
++    indices = {value: index for index, value in enumerate(read_priorities())}
++    for entry in entries:
++        entry.priority = indices.get(entry.command) if entry.favorite else None
++    return sorted(entries, key=lambda e: (0 if e.priority is not None else 1 if e.favorite else 2,
++                                            e.priority if e.priority is not None else 0, -e.recent))
++
++
+ def entry_row(index, entry):
+-    color = '\x1b[31m' if entry.secrets else '\x1b[33m' if entry.favorite else ''
++    color = '\x1b[31m' if entry.secrets else '\x1b[32m' if entry.priority is not None else '\x1b[33m' if entry.favorite else ''
+     warning = '[POSSIBLE SECRET: ' + ', '.join(entry.secrets) + '] ' if entry.secrets else ''
+     return (f'{index}\t{color}{warning}' +
+-            f"{'★' if entry.favorite else '·'}  {entry.count:>4}x  {display(entry.command)}" +
++            f"{'◆' if entry.priority is not None else '★' if entry.favorite else '·'}  {entry.count:>4}x  {display(entry.command)}" +
+             ('\x1b[0m' if color else '') + '\n')
+ 
+ 
+@@ -221,8 +290,10 @@
+             return run_picker(argv, input=kwargs["input"], env=kwargs["env"], config=_VISUAL_CONFIG)
+         return subprocess.run(argv, **kwargs)
+     notice = ""
++    view = "favorites" if favorites_only else "local"
+     while True:
+-        rows = ''.join(entry_row(index, entry) for index, entry in enumerate(entries))
++        visible = [entry for entry in entries if view != "favorites" or entry.favorite]
++        rows = ''.join(entry_row(index, entry) for index, entry in enumerate(entries) if entry in visible)
+         warnings = sum(bool(entry.secrets) for entry in entries)
+         # Errors too long for the bottom status area open a readable dialog.
+         # Keep the short status string, never truncate the actual message.
+@@ -235,13 +306,13 @@
+         result = invoke(
+             [fzf, *fzf_options(detect(sys.stderr).truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--no-multi", "--layout=reverse",
+              "--padding=0,3,0,3", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
+-             "--border-label= CMDVAULT / " + ("FAVORITES " if favorites_only else "HISTORY "),
+-             "--header=ENTER " + enter_action + " · CTRL-S / ALT-F save favorite (stay open) · CTRL-D delete permanently · CTRL-Y copy · ESC cancel" +
++             "--border-label= CMDVAULT / " + view.upper() + " ",
++             "--header=CTRL-G GLOBAL · CTRL-F FAVORITES · CTRL-L LOCAL · CTRL-P PRIORITY · ALT-↑/↓ REORDER · CTRL-H HELP" +
+              f"\n{warnings} possible secret(s): red rows first. Review and use CTRL-D to remove." + visible_notice,
+              "--sync", "--with-shell=bash -c",
+              "--bind=result:last+pos(" + str(position) + ")+unbind(result)",
+              '--bind=focus:execute-silent(printf "%s" "$FZF_POS" > "$CMDVAULT_POSITION_FILE")',
+-             "--expect=ctrl-s,alt-f,ctrl-y,ctrl-d", "--query=" + query],
++             "--expect=ctrl-s,alt-f,ctrl-y,ctrl-d,ctrl-g,ctrl-f,ctrl-l,ctrl-p,alt-up,alt-down", "--query=" + query],
+             input=rows, capture_output=True, text=True, env=env,
+         )
+         if result.returncode in (1, 130):
+@@ -249,9 +320,14 @@
+         if result.returncode:
+             raise ValueError("fzf failed: " + result.stderr.strip())
+         lines = result.stdout.splitlines()
+-        if len(lines) != 3 or lines[1] not in ("", "ctrl-s", "alt-f", "ctrl-y", "ctrl-d"):
++        if len(lines) != 3 or lines[1] not in ("", "ctrl-s", "alt-f", "ctrl-y", "ctrl-d", "ctrl-g", "ctrl-f", "ctrl-l", "ctrl-p", "alt-up", "alt-down"):
+             raise ValueError("Invalid picker output.")
+         query, key, row = lines
++        if key in ("ctrl-g", "ctrl-f", "ctrl-l"):
++            view = {"ctrl-g": "global", "ctrl-f": "favorites", "ctrl-l": "local"}[key]
++            notice = "\nGLOBAL currently uses local history; remote history is not imported yet." if view == "global" else ""
++            position = 1
++            continue
+         try:
+             index = int(row.split("\t", 1)[0])
+             if not 0 <= index < len(entries):
+@@ -262,6 +338,20 @@
+             position = max(1, int(position_path.read_text(encoding='utf-8')))
+         except (OSError, ValueError):
+             position = index + 1
++        if key == "ctrl-p":
++            try:
++                prioritize_favorite(entries[index].command)
++                entries[index].favorite = True
++                entries[:] = entries_from_current(entries)
++                notice = "\n◆ Priority favorite saved."
++            except (OSError, ValueError) as error:
++                notice = "\nPriority save failed: " + display(str(error))
++            continue
++        if key in ("alt-up", "alt-down"):
++            if reorder_priority(entries[index].command, -1 if key == "alt-up" else 1):
++                entries[:] = entries_from_current(entries)
++                notice = "\nPriority order updated."
++            continue
+         if key == "ctrl-d":
+             try:
+                 if not confirm_delete(entries[index].command):

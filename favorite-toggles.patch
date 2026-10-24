@@ -1,0 +1,66 @@
+--- a/cmdvault
++++ b/cmdvault
+@@ -100,10 +100,30 @@
+             os.unlink(temporary)
+ 
+ 
+-def prioritize_favorite(command):
+-    update_favorite(favorites_path(), command)
++def toggle_priority_favorite(command):
++    """Promote to priority, or demote to an ordinary favorite."""
+     priorities = read_priorities()
++    if command in priorities:
++        write_priorities([x for x in priorities if x != command])
++        return False
++    # Persist favorite before publishing the priority marker.
++    if command not in read_favorites(favorites_path()):
++        update_favorite(favorites_path(), command)
+     write_priorities([command, *(x for x in priorities if x != command)])
++    return True
++
++
++def toggle_favorite(command):
++    """Add an ordinary favorite; remove existing favorite and priority together."""
++    path = favorites_path()
++    if command in read_favorites(path):
++        update_favorite(path, command, remove=True)
++        priorities = read_priorities()
++        if command in priorities:
++            write_priorities([x for x in priorities if x != command])
++        return False
++    update_favorite(path, command)
++    return True
+ 
+ 
+ def reorder_priority(command, direction):
+@@ -340,10 +360,10 @@
+             position = index + 1
+         if key == "ctrl-p":
+             try:
+-                prioritize_favorite(entries[index].command)
++                promoted = toggle_priority_favorite(entries[index].command)
+                 entries[index].favorite = True
+                 entries[:] = entries_from_current(entries)
+-                notice = "\n◆ Priority favorite saved."
++                notice = "\n◆ Priority favorite enabled." if promoted else "\n★ Priority removed; ordinary favorite retained."
+             except (OSError, ValueError) as error:
+                 notice = "\nPriority save failed: " + display(str(error))
+             continue
+@@ -371,12 +391,13 @@
+         if key not in ("ctrl-s", "alt-f"):
+             return key, entries[index].command
+         try:
+-            update_favorite(favorites_path(), entries[index].command)
++            added = toggle_favorite(entries[index].command)
+         except (OSError, ValueError) as error:
+-            notice = "\nSave failed: " + display(str(error))
++            notice = "\nFavorite update failed: " + display(str(error))
+         else:
+-            entries[index].favorite = True
+-            notice = "\n★ Favorite saved. Possible secrets stay red; other favorites are yellow."
++            entries[index].favorite = added
++            entries[:] = entries_from_current(entries)
++            notice = "\n★ Favorite enabled." if added else "\nFavorite removed (and priority cleared)."
+         # Preserve ordering for this picker session, including filtered results.
+ 
+ 
