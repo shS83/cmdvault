@@ -1,5 +1,5 @@
 #!/bin/bash
-DB="/home/santeri/.local/share/cmdvault/favorites.sync.sqlite3"
+DB="$HOME/.local/share/cmdvault/favorites.sync.sqlite3"
 sqlite3 "$DB" "
 SELECT COUNT(*) AS received FROM cv_remote_inbox;
 SELECT COUNT(*) AS revisions FROM cv_remote_revisions;
