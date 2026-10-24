@@ -2,18 +2,21 @@
 """Find and keep useful commands from your own Bash history."""
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import shlex
+import socket
 import subprocess
 import sys
 import tempfile
 
 # The installer places the same package beside the executable.
 from src.sync.favorites import FavoritesBridge
+from src.sync.global_history import remote_metadata
 from src.visuals.config import VisualConfig
 from src.visuals.ansi import fzf_options
 from src.visuals.detector import detect, select
@@ -22,7 +25,7 @@ from src.visuals.picker import run_picker
 
 _VISUAL_CONFIG = VisualConfig()
 
-VERSION = "0.1.7"
+VERSION = "0.2.0-global"
 
 # Require data fields as well as a prefix: documentation mentioning "$6$"
 # or shell references such as "$6" alone should not trigger a warning.
@@ -36,6 +39,7 @@ class Entry:
 	recent: int = -1
 	favorite: bool = False
 	priority: int | None = None
+	hosts: tuple = ()
 	secrets: tuple = field(init=False)
 
 	def __post_init__(self):
@@ -98,6 +102,48 @@ def write_priorities(items):
 	finally:
 		if os.path.exists(temporary):
 			os.unlink(temporary)
+	_sync_priority_metadata(items)
+
+
+def _sync_priority_metadata(items):
+	"""Stage priority changes only for records already approved for Cloud Sync."""
+	from src.database import transaction
+	from src.sync.store import LocalStore
+	from src.security.secrets import CommandSecretScanner
+	root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+	db = root / "cmdvault/favorites.sync.sqlite3"
+	if not db.is_file():
+		return
+	order = {command: index for index, command in enumerate(items)}
+	with LocalStore(db) as store, transaction(store.connection):
+		for record in store.records("command"):
+			if record.sync_state.value != "sync_eligible":
+				continue
+			data = dict(record.data)
+			command = data.get("command")
+			if command in order:
+				data["priority"] = order[command]
+				data["favorite"] = True
+			else:
+				data.pop("priority", None)
+			if data != record.data:
+				result = CommandSecretScanner().scan(data)
+				if not result.allowed:
+					raise ValueError("Priority metadata failed local secret check")
+				store._put("command", record_natural_key(command), data)
+
+
+def record_natural_key(command):
+	from src.sync.store import natural_key
+	return natural_key("command", command)
+
+
+def stage_current_approved_metadata():
+	"""Queue favorite/priority changes for previously reviewed records only."""
+	from src.sync.approved_metadata import stage_approved_metadata
+	root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+	return stage_approved_metadata(root / "cmdvault/favorites.sync.sqlite3",
+		read_favorites(favorites_path()), read_priorities())
 
 
 def toggle_priority_favorite(command):
@@ -105,11 +151,13 @@ def toggle_priority_favorite(command):
 	priorities = read_priorities()
 	if command in priorities:
 		write_priorities([x for x in priorities if x != command])
+		stage_current_approved_metadata()
 		return False
 	# Persist favorite before publishing the priority marker.
 	if command not in read_favorites(favorites_path()):
 		update_favorite(favorites_path(), command)
 	write_priorities([command, *(x for x in priorities if x != command)])
+	stage_current_approved_metadata()
 	return True
 
 
@@ -121,8 +169,10 @@ def toggle_favorite(command):
 		priorities = read_priorities()
 		if command in priorities:
 			write_priorities([x for x in priorities if x != command])
+		stage_current_approved_metadata()
 		return False
 	update_favorite(path, command)
+	stage_current_approved_metadata()
 	return True
 
 
@@ -136,6 +186,7 @@ def reorder_priority(command, direction):
 		return False
 	priorities[i], priorities[j] = priorities[j], priorities[i]
 	write_priorities(priorities)
+	stage_current_approved_metadata()
 	return True
 
 
@@ -261,8 +312,9 @@ def entries_from_current(entries):
 def entry_row(index, entry):
 	color = '\x1b[31m' if entry.secrets else '\x1b[32m' if entry.priority is not None else '\x1b[33m' if entry.favorite else ''
 	warning = '[POSSIBLE SECRET: ' + ', '.join(entry.secrets) + '] ' if entry.secrets else ''
+	hosts = '[' + ', '.join(entry.hosts) + '] ' if entry.hosts else ''
 	return (f'{index}\t{color}{warning}' +
-			f"{'◆' if entry.priority is not None else '★' if entry.favorite else '·'}  {entry.count:>4}x  {display(entry.command)}" +
+			f"{'◆' if entry.priority is not None else '★' if entry.favorite else '·'}  {entry.count:>4}x  {hosts}{display(entry.command)}" +
 			('\x1b[0m' if color else '') + '\n')
 
 
@@ -304,6 +356,8 @@ def _cv_confirm_batch_delete(count, terminal="/dev/tty"):
 
 
 def pick_loop(entries, query, favorites_only, enter_action, history_path, position_path):
+	local_entries = entries
+	global_entries = None
 	fzf = shutil.which("fzf")
 	if not fzf:
 		raise ValueError("fzf is required for the picker. Install it or use --list.")
@@ -335,27 +389,54 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 	notice = ""
 	view = "favorites" if favorites_only else "local"
 	while True:
+		if view == "global":
+			if global_entries is None:
+				root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+				remote = remote_metadata(root / "cmdvault/favorites.sync.sqlite3")
+				current_host = socket.gethostname().split('.')[0].upper()
+				by_command = {e.command: replace(e, hosts=(current_host,)) for e in local_entries}
+				for command, metadata in remote.items():
+					entry = by_command.setdefault(command, Entry(command))
+					entry.favorite |= metadata["favorite"]
+					if entry.priority is None and metadata["priority"] is not None:
+						entry.priority = metadata["priority"]
+					entry.hosts = tuple(sorted(set(entry.hosts) | set(metadata['hosts'])))
+					# Locally repeated commands overlap with that host's synced count.
+					# Avoid double counting when its approved record is present.
+					entry.count = max(entry.count, metadata["count"])
+				global_entries = sorted(by_command.values(), key=lambda e: (0 if e.priority is not None else 1 if e.favorite else 2, e.priority if e.priority is not None else 0, -e.recent))
+			entries = global_entries
+		else:
+			entries = local_entries
 		visible = [entry for entry in entries if view != "favorites" or entry.favorite]
 		rows = ''.join(entry_row(index, entry) for index, entry in enumerate(entries) if entry in visible)
 		warnings = sum(bool(entry.secrets) for entry in entries)
 		# Errors too long for the bottom status area open a readable dialog.
 		# Keep the short status string, never truncate the actual message.
 		message = notice.strip()
-		modal = message.lower().startswith(("error", "cloud sync: error", "save failed", "deletion failed")) and len(message) > 65
+		modal = message.lower().startswith(("error", "cloud sync: error", "save failed", "deletion failed"))
 		env.pop("CMDVAULT_ERROR_MODAL", None)
 		if modal and neon_picker:
 			env["CMDVAULT_ERROR_MODAL"] = message
 		visible_notice = ("\nError — see dialog (ESC to close)." if modal and neon_picker else notice)
+		# Full command preview is intentionally separate from the one-line fzf row.
+		# Only the stable numeric row ID is handed to the preview renderer.
+		preview_file = position_path.parent / "commands-preview.json"
+		preview_file.write_text(json.dumps([item.command for item in entries], ensure_ascii=False), encoding="utf-8")
+		preview_cmd = ("python3 " + shlex.quote(str(Path(__file__).resolve().parent / "src/visuals/command_preview.py"))
+			+ " " + shlex.quote(str(preview_file)) + " {}")
 		result = invoke(
 			[fzf, *fzf_options(detect(sys.stderr).truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--multi", "--bind=ctrl-space:toggle-down", "--layout=reverse",
+			 "--preview=" + preview_cmd, "--preview-window=right:60%:wrap:hidden",
+			 "--bind=right:show-preview,left:hide-preview,ctrl-o:toggle-preview,alt-right:preview-page-down,alt-left:preview-page-up,pgup:preview-page-up,pgdn:preview-page-down",
 			 "--padding=0,2,0,2", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
 			 "--border-label= CMDVAULT / " + view.upper() + " ",
-			 "--header=CTRL-G GLOBAL · CTRL-F FAVORITES · CTRL-L LOCAL · CTRL-P PRIORITY · ALT-↑/↓ REORDER · CTRL-H HELP" +
+			 "--header=→ PREVIEW · ← CLOSE · CTRL-O TOGGLE PREVIEW · CTRL-G GLOBAL · CTRL-F FAVORITES · CTRL-L LOCAL · CTRL-P PRIORITY · CTRL-R SYNC" +
 			 f"\n{warnings} possible secret(s): red rows first. Review and use CTRL-D to remove." + visible_notice,
 			 "--sync", "--with-shell=bash -c",
 			 "--bind=result:last+pos(" + str(position) + ")+unbind(result)",
 			 '--bind=focus:execute-silent(printf "%s" "$FZF_POS" > "$CMDVAULT_POSITION_FILE")',
-			 "--expect=ctrl-s,alt-f,ctrl-y,ctrl-d,ctrl-g,ctrl-f,ctrl-l,ctrl-p,alt-up,alt-down", "--query=" + query],
+			 "--expect=ctrl-s,alt-f,ctrl-y,ctrl-d,ctrl-g,ctrl-f,ctrl-l,ctrl-p,alt-up,alt-down,ctrl-r", "--query=" + query],
 			input=rows, capture_output=True, text=True, env=env,
 		)
 		if result.returncode in (1, 130):
@@ -368,7 +449,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			"",
 			"ctrl-s", "alt-f", "ctrl-y", "ctrl-d",
 			"ctrl-g", "ctrl-f", "ctrl-l", "ctrl-p",
-			"alt-up", "alt-down",
+			"alt-up", "alt-down", "ctrl-r",
 		}
 
 		if len(lines) < 2 or lines[1] not in valid_keys:
@@ -377,6 +458,25 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 		query, key = lines[:2]
 		selected_rows = lines[2:]
 
+		if key == "ctrl-r":
+			try:
+				stage_current_approved_metadata()
+				from src.sync.interactive import sync_now
+				root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+				db_path = root / "cmdvault/favorites.sync.sqlite3"
+				db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+				from src.sync.store import LocalStore
+				with LocalStore(db_path):
+					pass
+				result = sync_now(db_path,
+                    history_path=history_path or Path(os.environ.get("HISTFILE") or Path.home() / ".bash_history"),
+                    favorites_path=favorites_path(), priority_path=priority_path())
+				global_entries = None
+				notice = f"\nCloud Sync: staged {result['imported']['newly_approved']}, excluded {result['imported']['excluded']}, pushed {result['pushed']}, received {result['received']}, pending {result['pending']}."
+			except (Exception,) as error:
+				notice = "\nCloud Sync: error: " + display(str(error))
+			position = 1
+			continue
 		# Näkymää voi vaihtaa ilman valittua komentoa.
 		if key in ("ctrl-g", "ctrl-f", "ctrl-l"):
 			view = {
@@ -385,11 +485,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 				"ctrl-l": "local",
 				}[key]
 
-			notice = (
-				"\nGLOBAL currently uses local history; "
-				"remote history is not imported yet."
-				if view == "global" else ""
-			)
+			notice = "\nGLOBAL includes downloaded approved commands." if view == "global" else ""
 			position = 1
 			continue
 
@@ -401,7 +497,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 		row = selected_rows[0]
 		if key in ("ctrl-g", "ctrl-f", "ctrl-l"):
 			view = {"ctrl-g": "global", "ctrl-f": "favorites", "ctrl-l": "local"}[key]
-			notice = "\nGLOBAL currently uses local history; remote history is not imported yet." if view == "global" else ""
+			notice = "\nGLOBAL includes downloaded approved commands." if view == "global" else ""
 			position = 1
 			continue
 		try:
@@ -419,6 +515,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 				promoted = toggle_priority_favorite(entries[index].command)
 				entries[index].favorite = True
 				entries[:] = entries_from_current(entries)
+				global_entries = None
 				notice = "\n◆ Priority favorite enabled." if promoted else "\n★ Priority removed; ordinary favorite retained."
 			except (OSError, ValueError) as error:
 				notice = "\nPriority save failed: " + display(str(error))
@@ -426,7 +523,11 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 		if key in ("alt-up", "alt-down"):
 			if reorder_priority(entries[index].command, -1 if key == "alt-up" else 1):
 				entries[:] = entries_from_current(entries)
+				global_entries = None
 				notice = "\nPriority order updated."
+			continue
+		if key == "ctrl-d" and view == "global":
+			notice = "\nDeletion disabled in GLOBAL; switch to LOCAL (Ctrl-L)."
 			continue
 		if key == "ctrl-d":
 			# With --multi fzf prints marked rows; without marks it returns
@@ -466,6 +567,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 		else:
 			entries[index].favorite = added
 			entries[:] = entries_from_current(entries)
+			global_entries = None
 			notice = "\n★ Favorite enabled." if added else "\nFavorite removed (and priority cleared)."
 		# Preserve ordering for this picker session, including filtered results.
 
@@ -557,6 +659,11 @@ def main(argv=None):
 			if query.casefold() in entry.command.casefold():
 				print(entry.command)
 		return 0
+	if not entries and not args.favorites:
+		root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+		# Allow opening the picker even on a machine with only remote commands.
+		if remote_commands(root / "cmdvault/favorites.sync.sqlite3"):
+			entries = [Entry("(Ctrl-G: open GLOBAL history)")]
 	if not entries:
 		print(f"cmdvault: No commands found. Favorites file: {path}. Save with Ctrl-S / Alt-F or --add; Ctrl-Y only copies.", file=sys.stderr)
 		return 1

@@ -1,4 +1,0 @@
-1. Synckey export/import
-2. Alusta paikallinen DB
-3. sync-approved.py
-4. Tarkista

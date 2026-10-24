@@ -73,13 +73,26 @@ class CommandSecretScanner:
         texts = []
         for key, value in payload.items():
             if key not in {"command", "name", "description", "tags", "favorite",
-                           "command_uuid", "tag_uuid"}:
+                           "command_uuid", "tag_uuid", "count", "priority", "hostname"}:
                 return ScanResult(False, ("unknown_payload",))
-            if isinstance(value, str):
+            if key == "count":
+                if type(value) is not int or not 1 <= value <= 100000000:
+                    return ScanResult(False, ("unknown_payload",))
+            elif key == "priority":
+                if type(value) is not int or not 0 <= value <= 100000000:
+                    return ScanResult(False, ("unknown_payload",))
+            elif key == "hostname":
+                if not isinstance(value, str) or not 1 <= len(value) <= 80 or any(c in value for c in "\r\n\t\x1b"):
+                    return ScanResult(False, ("unknown_payload",))
+            elif isinstance(value, str):
                 texts.append(value)
             elif isinstance(value, list) and all(isinstance(item, str) for item in value):
                 texts.extend(value)
             elif type(value) is bool and key == "favorite":
+                pass
+            elif key == "count" and type(value) is int and 1 <= value <= 100000000:
+                pass
+            elif key == "priority" and type(value) is int and 0 <= value <= 100000000:
                 pass
             else:
                 return ScanResult(False, ("unknown_payload",))

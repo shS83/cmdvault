@@ -4,11 +4,13 @@ import argparse
 import os
 from pathlib import Path
 import re
+import socket
 import sys
 
 from src.models import SyncState
 from src.security.secrets import CommandSecretScanner
 from src.sync.store import LocalStore, natural_key
+from src.database import transaction
 
 
 def history_commands(text):
@@ -65,16 +67,28 @@ def selections(value, n):
 def approve(store, commands):
     scanner = CommandSecretScanner()
     approved = 0
-    for command in commands:
+    pairs = commands.items() if hasattr(commands, "items") else ((command, 1) for command in commands)
+    for command, occurrences in pairs:
         # Protect existing favorites and never resurrect a local tombstone.
         key = natural_key('command', command)
         row = store.connection.execute('SELECT uuid, deleted_at FROM cv_records WHERE natural_key=?', (key,)).fetchone()
         if row is not None and row['deleted_at'] is not None:
             continue
         if row is None:
-            record = store.put_command(command, favorite=False)
+            record = store.put_command(command, favorite=False, count=occurrences)
         else:
             record = store.get(row['uuid'])
+            # Keep existing favorite/priority metadata; preserve higher usage count.
+            old_count = record.data.get('count', 0)
+            record = store.put_command(command, favorite=record.data.get('favorite', False),
+                                       count=max(old_count, occurrences))
+        # Persist the actual source machine in the approved encrypted record.
+        # Historical pre-v2 records already on the server are handled separately.
+        data = dict(record.data)
+        if 'hostname' not in data:
+            data['hostname'] = socket.gethostname().split('.')[0].upper()
+            with transaction(store.connection):
+                record = store._put('command', key, data)
         # Recheck exactly what we are about to approve.
         if not scanner.scan(record.data).allowed:
             continue
@@ -118,7 +132,7 @@ def main(argv=None, *, input_fn=input, output=sys.stdout):
         return 0
     # Database is touched only after explicit approval.
     with LocalStore(db) as store:
-        count = approve(store, [items[i] for i in selected])
+        count = approve(store, {items[i]: candidates[items[i]] for i in selected})
     print(f'Marked {count} records sync_eligible in {db}. No network operation was performed.', file=output)
     return 0
 
