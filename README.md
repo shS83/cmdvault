@@ -339,3 +339,11 @@ uv run --extra graphics python -m unittest discover -s tests -v
 
 All sync tests use temporary files; socket creation is forbidden in the offline
 operation test. No test contacts a service or reads the user's stored history.
+
+## Private Cloud Sync server
+
+The optional Django server lives in [`srv/`](srv/README.md), with its own uv
+environment and PostgreSQL database. Its versioned wire contract is documented in
+[`docs/sync-api.md`](docs/sync-api.md). Server dependencies are not installed with
+the client. Real history synchronization remains disabled until client encryption,
+key recovery and secret filtering are implemented and tested end to end.

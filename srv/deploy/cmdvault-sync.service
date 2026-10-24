@@ -1,0 +1,29 @@
+[Unit]
+Description=Private cmdvault Cloud Sync
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=cmdvault
+Group=cmdvault
+WorkingDirectory=/opt/cmdvault/srv
+EnvironmentFile=/etc/cmdvault/server.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/cmdvault/srv/.venv/bin/granian --interface asgi --host 127.0.0.1 --port 8017 --workers 2 --no-access-log config.asgi:application
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
