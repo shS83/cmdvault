@@ -1,0 +1,45 @@
+--- a/src/visuals/picker.py
++++ b/src/visuals/picker.py
+@@ -22,6 +22,22 @@
+ 
+ PULSE_RESERVED_ROWS = 5
+ PULSE_BG = "\x1b[48;2;11;8;18m"
++
++# Label colors are intentionally independent of the metallic orb surface.
++PULSE_LABEL_COLORS = {
++    "ready": (242, 240, 246),
++    "syncing": (179, 92, 255),
++    "synced": (64, 230, 155),
++    "error": (255, 64, 88),
++    "offline": (255, 209, 102),
++    "disabled": (119, 119, 131),
++}
++
++
++def pulse_label_color(label: str) -> str:
++    rgb = PULSE_LABEL_COLORS.get(label.lower(), PULSE_LABEL_COLORS["ready"])
++    return f"\x1b[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
++
+ 
+ 
+ def with_pulse_margin(argv: Sequence[str], rows: int, columns: int) -> list[str]:
+@@ -73,7 +89,7 @@
+     column = max(3, min(columns - 12, round((center_x - orb_size / 2 - 12 * cw) / cw) + 1))
+     row = max(rows - PULSE_RESERVED_ROWS + 1, min(rows - 1, round(center_y / ch) + 1))
+     return (f'\x1b7\x1b[{row};{column}H' + PULSE_BG +
+-            '\x1b[38;2;199;180;216m' + f'{label:>11}' +
++            pulse_label_color(label) + f'{label:>11}' +
+             '\x1b[0m\x1b8')
+ 
+ 
+@@ -146,6 +162,10 @@
+     while pulse_id == decoration.image_id:
+         pulse_id = secrets.randbelow(2**31 - 1) + 1
+     pulse = KittyPulseOverlay(config, pulse_id)
++    # Explicit, local-only visual preview; no sync API calls or history access.
++    demo_state = os.environ.get("CMDVAULT_PULSE_DEMO", "").strip().lower()
++    if demo_state in PULSE_LABEL_COLORS:
++        pulse.set_state(demo_state)
+     process = None
+     previous_signal = None
+     exit_signals = {}

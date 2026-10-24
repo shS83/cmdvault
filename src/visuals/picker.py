@@ -20,8 +20,24 @@ from .kitty import KittyDecoration, AnimationLoader, KittyPulseOverlay
 import secrets
 
 
-PULSE_RESERVED_ROWS = 5
+PULSE_RESERVED_ROWS = 4
 PULSE_BG = "\x1b[48;2;11;8;18m"
+
+# Label colors are intentionally independent of the metallic orb surface.
+PULSE_LABEL_COLORS = {
+    "ready": (242, 240, 246),
+    "syncing": (179, 92, 255),
+    "synced": (64, 230, 155),
+    "error": (255, 64, 88),
+    "offline": (255, 209, 102),
+    "disabled": (119, 119, 131),
+}
+
+
+def pulse_label_color(label: str) -> str:
+    rgb = PULSE_LABEL_COLORS.get(label.lower(), PULSE_LABEL_COLORS["ready"])
+    return f"\x1b[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+
 
 
 def with_pulse_margin(argv: Sequence[str], rows: int, columns: int) -> list[str]:
@@ -50,22 +66,6 @@ def with_pulse_margin(argv: Sequence[str], rows: int, columns: int) -> list[str]
     return arguments
 
 
-def with_full_command_preview(argv: Sequence[str]) -> list[str]:
-    """Right opens a wrapped full-command preview; Left closes it.
-
-    fzf remains responsible for selection, filtering and keyboard processing.
-    Field 1 is the hidden command identity; fields 2.. are the display text.
-    The placeholder is shell-quoted by fzf, and printf never evaluates commands.
-    """
-    arguments = list(argv)
-    arguments.extend((
-        "--preview", "printf '%s\n' {2..}",
-        "--preview-window", "down:5:hidden:wrap:border-top",
-        "--bind", "right:show-preview,left:hide-preview",
-    ))
-    return arguments
-
-
 def pulse_background_packet(columns: int, rows: int) -> str:
     """Fill only the interior of fzf's reserved rows, leaving frame margins clear."""
     if rows < 14 or columns < 32:
@@ -89,7 +89,7 @@ def pulse_label_packet(columns: int, rows: int, label: str, *, pixel_width: int 
     column = max(3, min(columns - 12, round((center_x - orb_size / 2 - 12 * cw) / cw) + 1))
     row = max(rows - PULSE_RESERVED_ROWS + 1, min(rows - 1, round(center_y / ch) + 1))
     return (f'\x1b7\x1b[{row};{column}H' + PULSE_BG +
-            '\x1b[38;2;199;180;216m' + f'{label:>11}' +
+            pulse_label_color(label) + f'{label:>11}' +
             '\x1b[0m\x1b8')
 
 
@@ -162,6 +162,10 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
     while pulse_id == decoration.image_id:
         pulse_id = secrets.randbelow(2**31 - 1) + 1
     pulse = KittyPulseOverlay(config, pulse_id)
+    # Explicit, local-only visual preview; no sync API calls or history access.
+    demo_state = os.environ.get("CMDVAULT_PULSE_DEMO", "").strip().lower()
+    if demo_state in PULSE_LABEL_COLORS:
+        pulse.set_state(demo_state)
     process = None
     previous_signal = None
     exit_signals = {}
@@ -203,7 +207,7 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
             tty.setraw(terminal)
             emit('\x1b[?1049h\x1b[2J\x1b[H')
             screen_entered = True
-            picker_args = with_pulse_margin(with_full_command_preview(argv), rows, columns)
+            picker_args = with_pulse_margin(argv, rows, columns)
             process = subprocess.Popen(picker_args,stdin=source,stdout=result,stderr=slave,
                                        env=env,preexec_fn=child_terminal,close_fds=True)
             os.close(slave)
