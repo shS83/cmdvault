@@ -105,6 +105,20 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual([entry.command for entry in entries], ["ls", "ssh host", "ffmpeg -i 'a b'"])
         self.assertEqual([entry.count for entry in entries], [2, 0, 1])
 
+    def test_sort_modes(self):
+        entries = [vault.Entry('zebra', count=2), vault.Entry('Alpha', count=1),
+                   vault.Entry('beta', count=2)]
+        expected = {
+            'default': ['zebra', 'Alpha', 'beta'],
+            'a-z': ['Alpha', 'beta', 'zebra'],
+            'z-a': ['zebra', 'beta', 'Alpha'],
+            'most used': ['beta', 'zebra', 'Alpha'],
+            'least used': ['Alpha', 'beta', 'zebra'],
+        }
+        for mode, order in expected.items():
+            with self.subTest(mode=mode):
+                self.assertEqual([entry.command for entry in vault.sorted_entries(entries, mode)], order)
+
     def test_timestamped_multiline_and_legacy_prefix(self):
         history = 'old command\n#1700000000\nprintf "%s\\n" \\\n  "hello"\n#1700000001\nls\n'
         self.assertEqual(list(vault.history_commands(history)),
@@ -211,6 +225,19 @@ class VaultTests(unittest.TestCase):
 
 
 class PickerRegressionTests(unittest.TestCase):
+    def test_s_cycles_sort_and_selects_correct_command(self):
+        entries = [vault.Entry('zebra', count=3), vault.Entry('Alpha', count=1)]
+        responses = [subprocess.CompletedProcess([], 0, 'Al\ns\n', ''),
+                     subprocess.CompletedProcess([], 0, 'Al\n\n0\trow\n', '')]
+        with patch.object(vault.shutil, 'which', return_value='fzf'), \
+                patch.object(vault.subprocess, 'run', side_effect=responses) as run:
+            self.assertEqual(vault.pick(entries, '', False), ('', 'Alpha'))
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(run.call_args.kwargs['input'].startswith('0\t'))
+        self.assertIn('Alpha', run.call_args.kwargs['input'].splitlines()[0])
+        self.assertIn('--query=Al', run.call_args.args[0])
+        self.assertTrue(any(arg.startswith('--expect=s,') for arg in run.call_args.args[0]))
+
     def test_save_and_delete_keep_filtered_position_and_order(self):
         for key, accepted in [('ctrl-s', True), ('ctrl-d', True), ('ctrl-d', False)]:
             entries = [vault.Entry(f'echo {i}') for i in range(20)]

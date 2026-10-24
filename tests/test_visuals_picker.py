@@ -58,9 +58,21 @@ class NeonPickerTests(unittest.TestCase):
                 self.assertTrue(wrote_error)
                 self.assertIn(b'Cloud Sync: error: test detail', data)
                 self.assertIn(b'ERROR', data)
+                os.write(fd, b'\x1b')
+                exited = False
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    finished, status = os.waitpid(pid, os.WNOHANG)
+                    if finished:
+                        exited = True
+                        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+                        break
+                    time.sleep(.05)
+                self.assertTrue(exited, 'ESC on error dialog did not exit picker')
             finally:
-                os.kill(pid, signal.SIGTERM)
-                os.waitpid(pid, 0)
+                if not locals().get('exited', False):
+                    os.kill(pid, signal.SIGTERM)
+                    os.waitpid(pid, 0)
                 os.close(fd)
 
     def exercise(self, keys, expected_status, expected_text, animation=False):

@@ -310,6 +310,21 @@ def entries_from_current(entries):
 											e.priority if e.priority is not None else 0, -e.recent))
 
 
+SORT_MODES = ("default", "a-z", "z-a", "most used", "least used")
+
+
+def sorted_entries(entries, mode):
+	if mode == "a-z":
+		return sorted(entries, key=lambda e: (e.command.casefold(), e.command))
+	if mode == "z-a":
+		return sorted(entries, key=lambda e: (e.command.casefold(), e.command), reverse=True)
+	if mode == "most used":
+		return sorted(entries, key=lambda e: (-e.count, e.command.casefold(), e.command))
+	if mode == "least used":
+		return sorted(entries, key=lambda e: (e.count, e.command.casefold(), e.command))
+	return list(entries)
+
+
 HOST_COLORS = {
     "ALPHATAURI": (0, 229, 255),   # electric cyan
     "EPSILONTAURI": (255, 79, 216), # synthwave pink
@@ -446,6 +461,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 		pass
 	env["CMDVAULT_SYNC_STATUS_FILE"] = str(_sync_status_file)
 	view = "favorites" if favorites_only else "local"
+	sort_mode = 0
 	while True:
 		if _sync_thread is not None and not _sync_thread.is_alive():
 			_sync_thread.join()
@@ -475,8 +491,9 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			entries = global_entries
 		else:
 			entries = local_entries
-		visible = [entry for entry in entries if view != "favorites" or entry.favorite]
-		rows = ''.join(entry_row(index, entry) for index, entry in enumerate(entries) if entry in visible)
+		displayed_entries = sorted_entries(entries, SORT_MODES[sort_mode])
+		rows = ''.join(entry_row(index, entry) for index, entry in enumerate(displayed_entries)
+			if view != "favorites" or entry.favorite)
 		warnings = sum(bool(entry.secrets) for entry in entries)
 		# Errors too long for the bottom status area open a readable dialog.
 		# Keep the short status string, never truncate the actual message.
@@ -489,7 +506,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 		# Full command preview is intentionally separate from the one-line fzf row.
 		# Only the stable numeric row ID is handed to the preview renderer.
 		preview_file = position_path.parent / "commands-preview.json"
-		preview_file.write_text(json.dumps([{"command": item.command, "hosts": list(item.hosts) if view == "global" else []} for item in entries], ensure_ascii=False), encoding="utf-8")
+		preview_file.write_text(json.dumps([{"command": item.command, "hosts": list(item.hosts) if view == "global" else []} for item in displayed_entries], ensure_ascii=False), encoding="utf-8")
 		preview_cmd = ("python3 " + shlex.quote(str(Path(__file__).resolve().parent / "src/visuals/command_preview.py"))
 			+ " " + shlex.quote(str(preview_file)) + " {1}")
 		result = invoke(
@@ -497,13 +514,13 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			 "--preview=" + preview_cmd, "--preview-window=right:60%:wrap:hidden",
 			 "--bind=right:show-preview,left:hide-preview,ctrl-o:toggle-preview,alt-right:preview-page-down,alt-left:preview-page-up,pgup:preview-page-up,pgdn:preview-page-down",
 			 "--padding=0,2,0,2", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
-			 "--border-label= CMDVAULT / " + view.upper() + " ",
-			 "--header=→ PREVIEW · ← CLOSE · CTRL-O TOGGLE PREVIEW · CTRL-G GLOBAL · CTRL-F FAVORITES · CTRL-L LOCAL · CTRL-P PRIORITY · CTRL-R SYNC" +
-			 f"\n{warnings} possible secret(s): red rows first. Review and use CTRL-D to remove." + visible_notice,
+			 "--border-label= CMDVAULT / " + view.upper() + " / " + SORT_MODES[sort_mode].upper() + " ",
+			 "--header=→ PREVIEW · ← CLOSE · CTRL-O TOGGLE PREVIEW · S SORT · CTRL-G GLOBAL · CTRL-F FAVORITES · CTRL-L LOCAL · CTRL-P PRIORITY · CTRL-R SYNC" +
+			 f"\n{warnings} possible secret(s): red rows. Review and use CTRL-D to remove." + visible_notice,
 			 "--sync", "--with-shell=bash -c",
 			 "--bind=result:last+pos(" + str(position) + ")+unbind(result)",
 			 '--bind=focus:execute-silent(printf "%s" "$FZF_POS" > "$CMDVAULT_POSITION_FILE")',
-			 "--expect=ctrl-s,alt-f,ctrl-y,ctrl-d,ctrl-g,ctrl-f,ctrl-l,ctrl-p,alt-up,alt-down,ctrl-r", "--query=" + query],
+			 "--expect=s,ctrl-s,alt-f,ctrl-y,ctrl-d,ctrl-g,ctrl-f,ctrl-l,ctrl-p,alt-up,alt-down,ctrl-r", "--query=" + query],
 			input=rows, capture_output=True, text=True, env=env,
 		)
 		if result.returncode in (1, 130):
@@ -516,7 +533,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			"",
 			"ctrl-s", "alt-f", "ctrl-y", "ctrl-d",
 			"ctrl-g", "ctrl-f", "ctrl-l", "ctrl-p",
-			"alt-up", "alt-down", "ctrl-r",
+			"alt-up", "alt-down", "ctrl-r", "s",
 		}
 
 		if len(lines) < 2 or lines[1] not in valid_keys:
@@ -524,6 +541,10 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 
 		query, key = lines[:2]
 		selected_rows = lines[2:]
+		if key == "s":
+			sort_mode = (sort_mode + 1) % len(SORT_MODES)
+			position = 1
+			continue
 
 		if key == "ctrl-r":
 			if _sync_thread is not None and _sync_thread.is_alive():
@@ -538,7 +559,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 					db_path = root / "cmdvault/favorites.sync.sqlite3"
 					_cv_write_sync_status(_sync_status_file, "syncing", "Cloud Sync in progress")
 					_sync_thread = threading.Thread(target=_cv_sync_worker,
-						args=(db_path, history_path, _sync_status_file), daemon=False)
+						args=(db_path, history_path, _sync_status_file), daemon=True)
 					_sync_thread.start()
 					notice = "\nCloud Sync running in background…"
 				except Exception as error:
@@ -571,7 +592,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			continue
 		try:
 			index = int(row.split("\t", 1)[0])
-			if not 0 <= index < len(entries):
+			if not 0 <= index < len(displayed_entries):
 				raise ValueError
 		except ValueError:
 			raise ValueError("Invalid picker selection.") from None
@@ -581,8 +602,8 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			position = index + 1
 		if key == "ctrl-p":
 			try:
-				promoted = toggle_priority_favorite(entries[index].command)
-				entries[index].favorite = True
+				promoted = toggle_priority_favorite(displayed_entries[index].command)
+				displayed_entries[index].favorite = True
 				entries[:] = entries_from_current(entries)
 				global_entries = None
 				notice = "\n◆ Priority favorite enabled." if promoted else "\n★ Priority removed; ordinary favorite retained."
@@ -590,7 +611,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 				notice = "\nPriority save failed: " + display(str(error))
 			continue
 		if key in ("alt-up", "alt-down"):
-			if reorder_priority(entries[index].command, -1 if key == "alt-up" else 1):
+			if reorder_priority(displayed_entries[index].command, -1 if key == "alt-up" else 1):
 				entries[:] = entries_from_current(entries)
 				global_entries = None
 				notice = "\nPriority order updated."
@@ -600,8 +621,8 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			continue
 		if key == "ctrl-d":
 			# With --multi fzf prints marked rows; without marks it returns
-			# the current row. Every index refers to the original entries list.
-			indices = _cv_selection_indices(selected_rows, entries)
+			# the current row. Every index refers to the displayed order.
+			indices = _cv_selection_indices(selected_rows, displayed_entries)
 			if not indices:
 				notice = "\nNo commands selected."
 				continue
@@ -613,28 +634,27 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			occurrences = 0
 			try:
 				for selected_index in indices:
-					occurrences += delete_entry(target, entries[selected_index].command)
+					occurrences += delete_entry(target, displayed_entries[selected_index].command)
 					deleted_indices.append(selected_index)
 			except (OSError, ValueError) as error:
 				notice = "\nDeletion failed or was partial: " + display(str(error))
 			else:
 				notice = f"\nDeleted {len(deleted_indices)} command(s), {occurrences} history occurrence(s)."
-			# Remove successfully processed rows in descending index order.
-			for selected_index in sorted(deleted_indices, reverse=True):
-				entries.pop(selected_index)
+			for selected_index in deleted_indices:
+				entries.remove(displayed_entries[selected_index])
 			if not entries:
 				print("cmdvault: Selected commands deleted; no entries remain.", file=sys.stderr)
 				return None
 			position = 1
 			continue
 		if key not in ("ctrl-s", "alt-f"):
-			return key, entries[index].command
+			return key, displayed_entries[index].command
 		try:
-			added = toggle_favorite(entries[index].command)
+			added = toggle_favorite(displayed_entries[index].command)
 		except (OSError, ValueError) as error:
 			notice = "\nFavorite update failed: " + display(str(error))
 		else:
-			entries[index].favorite = added
+			displayed_entries[index].favorite = added
 			entries[:] = entries_from_current(entries)
 			global_entries = None
 			notice = "\n★ Favorite enabled." if added else "\nFavorite removed (and priority cleared)."

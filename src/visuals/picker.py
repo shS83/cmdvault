@@ -111,7 +111,8 @@ HELP_LINES = (
     "RIGHT       Show full command preview",
     "LEFT        Close command preview",
     "CTRL-H      Open / close this help",
-    "ESC         Cancel picker / close help",
+    "S           Cycle command sorting",
+    "ESC         Cancel picker (also on error) / close help",
 )
 
 
@@ -195,7 +196,7 @@ def error_modal_packet(columns: int, rows: int, message: str, scroll: int = 0) -
     lines = ['╭' + '─' * (width - 2) + '╮', frame('CMDVAULT  ·  ERROR'),
              '├' + '─' * (width - 2) + '┤']
     lines += [frame(s) for s in wrapped[start:start + visible]]
-    lines += [frame(f'↑/↓ scroll  ·  {start + 1}–{min(count, start + visible)}/{count}  ·  ESC / ENTER close'),
+    lines += [frame(f'↑/↓ scroll  ·  {start + 1}–{min(count, start + visible)}/{count}  ·  ESC exit / ENTER close'),
               '╰' + '─' * (width - 2) + '╯']
     return ('\x1b7' + ''.join(f'\x1b[{top+i};{left}H' + bg +
              (red if i in (0,1,2,len(lines)-1) else fg) + line for i,line in enumerate(lines)) +
@@ -371,7 +372,10 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                     if not keys:
                         break
                     if error_visible:
-                        if keys in (b"\x1b", b"\r", b"\n", b"\x08"):
+                        if keys == b"\x1b":
+                            error_visible = False
+                            write_all(master, keys)
+                        elif keys in (b"\r", b"\n", b"\x08"):
                             error_visible = False
                             emit('\x1b[2J\x1b[H')
                             decoration.key = None
