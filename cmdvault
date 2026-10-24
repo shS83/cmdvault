@@ -329,7 +329,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 	def invoke(argv, **kwargs):
 		if neon_picker:
 			argv = [arg for arg in argv if not arg.startswith(("--height=", "--border=", "--border-label="))]
-			argv += ["--no-clear", "--height=100%", "--border=none", "--margin=1,2"]
+			argv += ["--no-clear", "--height=100%", "--border=none", "--margin=1,1"]
 			return run_picker(argv, input=kwargs["input"], env=kwargs["env"], config=_VISUAL_CONFIG)
 		return subprocess.run(argv, **kwargs)
 	notice = ""
@@ -347,8 +347,8 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			env["CMDVAULT_ERROR_MODAL"] = message
 		visible_notice = ("\nError — see dialog (ESC to close)." if modal and neon_picker else notice)
 		result = invoke(
-			[fzf, *fzf_options(detect(sys.stderr).truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--multi", "--bind=ctrl-space:toggle-down", "--layout=reverse",
-			 "--padding=0,3,0,3", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
+			[fzf, *fzf_options(detect(sys.stderr).truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--multi", "--bind=shift-space:toggle-down", "--layout=reverse",
+			 "--padding=0,2,0,2", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
 			 "--border-label= CMDVAULT / " + view.upper() + " ",
 			 "--header=CTRL-G GLOBAL · CTRL-F FAVORITES · CTRL-L LOCAL · CTRL-P PRIORITY · ALT-↑/↓ REORDER · CTRL-H HELP" +
 			 f"\n{warnings} possible secret(s): red rows first. Review and use CTRL-D to remove." + visible_notice,
