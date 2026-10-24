@@ -6,7 +6,8 @@ The whole existing repository is needed for the shared
 [API contract](../docs/sync-api.md) in `src/sync/protocol.py`.
 
 **Real history sync is disabled.** The existing client has local storage/outbox
-and security interfaces, but no working transport, encryption or key recovery.
+and security interfaces, and now has an explicit authenticated CLI, a sealed-key workflow and a synthetic
+probe. Real record mapping, review and conflict recovery are unfinished.
 Use synthetic encrypted envelopes only for server development. Keep
 `SYNC_ENABLED=false` for deployment until the client security work passes
 end-to-end tests. The server never requests or stores encryption keys.
@@ -188,8 +189,9 @@ could become valid again. Signing-secret rotation invalidates all cursors.
 
 ### Current limits
 
-- No client networking, concrete AEAD cipher, secure key store, recovery workflow,
-  production secret scanner or end-to-end history sync is added/enabled here.
+- The client now has authenticated CLI commands and an explicit synthetic AEAD
+  probe with a passphrase-wrapped key. Real-record transport, historical import,
+  remote revision/conflict handling and automatic history sync remain disabled.
 - The server verifies envelope shape, not cryptographic validity; metadata
   (account/device identities, UUIDs, sizes, revisions, operations, timing) is visible.
 - Current tombstones are not client-signed. See the API contract's integrity note.

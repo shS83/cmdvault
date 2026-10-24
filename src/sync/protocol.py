@@ -75,3 +75,30 @@ def validate_login(value):
         text = value[name]
         if not isinstance(text, str) or not text.strip() or len(text) > maximum or any(ord(c) < 32 for c in text):
             raise ValueError("invalid_login_field")
+
+
+def validate_pull_response(value):
+    _fields(value, ("schema_version", "changes", "cursor", "has_more"))
+    _integer(value["schema_version"], SCHEMA_VERSION, SCHEMA_VERSION)
+    if not isinstance(value["changes"], list) or len(value["changes"]) > 500:
+        raise ValueError("invalid_changes")
+    if not isinstance(value["cursor"], str) or not value["cursor"] or len(value["cursor"]) > 1024:
+        raise ValueError("invalid_cursor")
+    if type(value["has_more"]) is not bool:
+        raise ValueError("invalid_has_more")
+    previous = 0
+    for change in value["changes"]:
+        _fields(change, ("change_id", "record_uuid", "revision", "sequence",
+                         "operation", "envelope", "timestamp"))
+        _uuid(change["change_id"])
+        _uuid(change["record_uuid"])
+        _integer(change["revision"], 1, MAX_REVISION)
+        _integer(change["sequence"], previous + 1, MAX_REVISION)
+        previous = change["sequence"]
+        if not isinstance(change["timestamp"], str) or len(change["timestamp"]) > 64:
+            raise ValueError("invalid_timestamp")
+        if change["operation"] == "upsert":
+            validate_envelope(change["envelope"])
+        elif change["operation"] != "delete" or change["envelope"] is not None:
+            raise ValueError("invalid_operation")
+    return value

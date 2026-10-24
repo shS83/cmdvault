@@ -26,51 +26,7 @@ VERSION = "0.1.7"
 
 # Require data fields as well as a prefix: documentation mentioning "$6$"
 # or shell references such as "$6" alone should not trigger a warning.
-PASSWORD_HASH_PATTERNS = (
-    ('yescrypt', re.compile(r'\$y\$[./A-Za-z0-9]+\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
-    ('gost-yescrypt', re.compile(r'\$gy\$[./A-Za-z0-9]+\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
-    ('scrypt', re.compile(r'\$7\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
-    ('SHA-512-crypt', re.compile(r'\$6\$(?:rounds=\d+\$)?[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
-    ('SHA-256-crypt', re.compile(r'\$5\$(?:rounds=\d+\$)?[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
-    ('MD5-crypt', re.compile(r'\$1\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
-    ('Apache MD5-crypt', re.compile(r'\$apr1\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{8,}')),
-    ('bcrypt', re.compile(r'\$2[abxy]?\$\d{2}\$[./A-Za-z0-9]{8,}')),
-    ('Argon2', re.compile(r'\$argon2(?:id|i|d)\$(?:v=\d+\$)?m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]{8,}')),
-)
-
-PRIVATE_KEY = re.compile(r'-----BEGIN (?:OPENSSH |RSA |EC |DSA |ENCRYPTED )?PRIVATE KEY-----')
-BEARER = re.compile(r'\bBearer\s+([A-Za-z0-9._~+/=-]{8,})', re.IGNORECASE)
-SECRET_VALUE = re.compile(
-    r'''(?ix)(?<![\w${])(?:[a-z][a-z0-9_]*_)?
-    (?:api[_-]?key|access[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|token|password|passwd)
-    ["']?\s*(?:=|:|\s)\s*["']?([^\s"'`;|&<>]+)''')
-TOKEN_SHAPES = re.compile(
-    r'(?<![\w])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}'
-    r'|sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})(?![\w])')
-
-
-def secret_reasons(command):
-    """Local heuristics only: never validate credentials or send them anywhere."""
-    reasons = []
-    # Shell-escaped dollar signs still represent the same literal hash.
-    hash_text = command.replace('\\$', '$')
-    for name, pattern in PASSWORD_HASH_PATTERNS:
-        if pattern.search(hash_text):
-            reasons.append(name + ' password hash')
-    if PRIVATE_KEY.search(command):
-        reasons.append('private key')
-    if BEARER.search(command):
-        reasons.append('Bearer token')
-    if TOKEN_SHAPES.search(command):
-        reasons.append('API token pattern')
-    for match in SECRET_VALUE.finditer(command):
-        value = match.group(1)
-        # References to shell variables are not literal credentials.
-        if len(value) >= 8 and not value.startswith(('$', '`')) and value.lower() not in (
-                'your_api_key', 'your_token', 'changeme', 'redacted', '[redacted]'):
-            reasons.append('literal credential')
-            break
-    return tuple(reasons)
+from src.security.secrets import PRIVATE_KEY, secret_reasons
 
 
 @dataclass
@@ -355,6 +311,13 @@ def execute_command(command):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # The Bash wrapper inserts --shell-output before the actual user arguments.
+    # Sync commands never write a shell selection, so dispatch them first.
+    sync_argv = argv[2:] if len(argv) >= 3 and argv[0] == "--shell-output" else argv
+    if sync_argv[:1] == ["sync"]:
+        from src.sync.cli import main as sync_main
+        return sync_main(sync_argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("query", nargs="*", help="initial fzf search; substring filter with --list")
     parser.add_argument("--version", action="version", version=f"cmdvault {VERSION}")

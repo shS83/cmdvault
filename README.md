@@ -229,9 +229,10 @@ checks. Compare `--no-animation`, `--graphics ansi` and redirected diagnostics.
 
 Protocol reference: [Kitty graphics and animation specification](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
 
-## Cloud Sync foundation (local only)
+## Cloud Sync foundation (initial local phase)
 
-This phase adds **no cloud connection, account, authentication or remote API**.
+The original local foundation added no cloud connection, account, authentication or remote API.
+The current explicit client commands are described in [Cloud Sync client](docs/sync-client.md).
 All existing search, execution, favorites, deletion, secret warnings, Bash hooks
 and Neon keyboard/UI behavior remain in place. No dependencies were added.
 
@@ -315,16 +316,19 @@ SQLite data is **not encrypted at rest** in this phase. Local favorites remain
 plaintext just as the JSON file is plaintext. Tombstones clear logical payloads;
 this is not secure erasure of SQLite pages, filesystem journals or backups.
 `src.security.crypto.PayloadCipher` and `src.security.secrets.SecretScanner`
-are explicit interfaces for the next phase. `prepare_change()` demonstrates
+remain the local outbox interfaces. A separate AES-GCM implementation and a
+conservative scanner now support explicit synthetic probes; they are not wired
+to real history transmission. `prepare_change()` demonstrates
 scanner/encryption injection and revision-bound associated metadata, without
 sending anything or acknowledging the event. No identity/plaintext cipher is
 provided. Delete preparation contains identity metadata only, never old content.
 
 ### Before the next phase
 
-Agree on the wire format and conflict/dependency ordering; implement authenticated
-client-side encryption (including tombstone metadata), key management and a real
-secret scanner; add account/transport logic and scoped atomic pull/cursor commits.
+The versioned wire format, device login, synthetic AES-GCM encryption and
+passphrase-wrapped key transfer now exist. Remaining work is authenticated
+tombstone metadata, conflict/dependency ordering, reviewed real-record eligibility,
+remote revision tracking and scoped atomic pull/cursor commits.
 Choose how a cloned/restored database receives a new device identity. Coordinate
 remote favorite updates through the JSON bridge rather than writing sidecar
 favorite flags directly. Decide tombstone retention/garbage collection and expose
@@ -345,5 +349,17 @@ operation test. No test contacts a service or reads the user's stored history.
 The optional Django server lives in [`srv/`](srv/README.md), with its own uv
 environment and PostgreSQL database. Its versioned wire contract is documented in
 [`docs/sync-api.md`](docs/sync-api.md). Server dependencies are not installed with
-the client. Real history synchronization remains disabled until client encryption,
-key recovery and secret filtering are implemented and tested end to end.
+the client. Real history synchronization remains disabled until the full
+record/revision/conflict path and reviewed historical import are implemented and
+tested end to end.
+
+## Cloud Sync client commands
+
+Run `cmdvault sync login USERNAME`, `status`, `devices`, `devices revoke UUID`,
+and `logout` to manage per-device access. `cmdvault sync key init/export/import`
+creates and transfers a passphrase-wrapped encryption key. An explicit
+`cmdvault sync now --test` exercises a synthetic encrypted push/pull, and
+`cmdvault sync now --verify UUID` checks it from a second enrolled device.
+See the [client guide](docs/sync-client.md) for safe setup, credential recovery
+and current limits. Plain `cmdvault sync now` reports readiness. It does not
+upload real commands. Login never imports old history or favorites.

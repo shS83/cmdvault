@@ -69,8 +69,9 @@ which overwrites client-supplied headers. Granian must remain bound to localhost
 The example uses **synthetic bytes, not encrypted command content**. Production
 v1 envelopes are reserved for AES-256-GCM: a unique 12-byte nonce per key, a
 positive integer key version, and canonical standard-base64 ciphertext including
-the 16-byte authentication tag (16..65536 decoded bytes). AES-GCM implementation,
-key provisioning, nonce generation and recovery are **not implemented here**.
+the 16-byte authentication tag (16..65536 decoded bytes). The client now uses
+AES-GCM and a manually transferred passphrase-wrapped key for synthetic probes.
+The full real-record adapter and recovery workflow remain unfinished.
 The server validates structure and size only; it cannot verify encryption or tags
 without the client's key. Base64 alone is not encryption. HTTPS is also required.
 
@@ -120,14 +121,14 @@ later pages. No compaction/expiry policy is currently implemented: keep all logs
 idempotency receipts and tombstones. Signing-key changes invalidate cursors and
 require a replay from the beginning with local revision deduplication.
 
-The future client must atomically apply a pull page and persist its cursor in its
+The future **real-history** client must atomically apply a pull page and persist its cursor in its
 local SQLite transaction. A push receipt must **not** advance the pull cursor or
 acknowledge newer coalesced outbox events. Preserve exact sent envelopes/change IDs
 across network retries, track remote revisions separately, and acknowledge only
 the accepted event ID. Existing `Outbox.acknowledge`, `SyncStateStore` and
 `prepare_change` remain the integration points; networking is not enabled.
 
-The future cipher must authenticate a stable canonical metadata representation
+The synthetic probe authenticates a stable canonical metadata representation
 that can be reconstructed from pull (including UUID, change ID, operation and
 remote base revision); record kind belongs inside the ciphertext. The existing
 preparation AAD uses local revision and kind, so it cannot be directly mapped to
@@ -144,6 +145,11 @@ requires a versioned signed/encrypted tombstone design before an E2EE claim.
 object above. Failed batches have no accepted mutations.
 
 `SYNC_ENABLED=false` is the default. Push/pull remain disabled for real history
-until encryption, decryption, key recovery, secret filtering and end-to-end client
-sync have been implemented and tested. Tests override this for synthetic envelopes.
-There is no claim of working end-to-end encryption in this change.
+until the complete real-record encryption/recovery, secret review, remote revision
+mapping, conflict handling and end-to-end client sync have been implemented and
+tested. Tests override this gate for synthetic envelopes. The explicit client
+probe is not a claim of working end-to-end encryption for real history.
+
+The current client can run an explicit synthetic AES-GCM round trip using the
+versioned API. It does not consume the real outbox or apply remote favorites.
+See [Cloud Sync client](sync-client.md).
