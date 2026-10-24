@@ -347,7 +347,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			env["CMDVAULT_ERROR_MODAL"] = message
 		visible_notice = ("\nError — see dialog (ESC to close)." if modal and neon_picker else notice)
 		result = invoke(
-			[fzf, *fzf_options(detect(sys.stderr).truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--multi", "--bind=shift-space:toggle-down", "--layout=reverse",
+			[fzf, *fzf_options(detect(sys.stderr).truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--multi", "--bind=ctrl-space:toggle-down", "--layout=reverse",
 			 "--padding=0,2,0,2", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
 			 "--border-label= CMDVAULT / " + view.upper() + " ",
 			 "--header=CTRL-G GLOBAL · CTRL-F FAVORITES · CTRL-L LOCAL · CTRL-P PRIORITY · ALT-↑/↓ REORDER · CTRL-H HELP" +
