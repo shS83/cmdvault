@@ -1,13 +1,17 @@
 import os
 import sys
 from pathlib import Path
+from environs import Env
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+env = Env()
+env.read_env(BASE_DIR / ".env")
+
 # One dependency-free wire contract, shared with the existing client.
 sys.path.insert(0, str(BASE_DIR.parent))
-SECRET_KEY = os.environ["DJANGO_SECRET_KEY"]
-DEBUG = False
-ALLOWED_HOSTS = os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+SECRET_KEY = env.str("DJANGO_SECRET_KEY")
+DEBUG = env.bool("DJANGO_DEBUG", False)
+ALLOWED_HOSTS = env.str("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 INSTALLED_APPS = ["django.contrib.auth", "django.contrib.contenttypes", "rest_framework",
                   "accounts", "devices", "synchronization"]
 MIDDLEWARE = ["django.middleware.security.SecurityMiddleware", "config.middleware.SafeBoundary", "django.middleware.csrf.CsrfViewMiddleware",
@@ -16,11 +20,11 @@ ROOT_URLCONF = "config.urls"
 ASGI_APPLICATION = "config.asgi.application"
 DATABASES = {"default": {
     "ENGINE": "django.db.backends.postgresql",
-    "NAME": os.getenv("PGDATABASE", "cmdvault"),
-    "USER": os.getenv("PGUSER", "cmdvault"),
-    "PASSWORD": os.getenv("PGPASSWORD", ""),
-    "HOST": os.getenv("PGHOST", "127.0.0.1"),
-    "PORT": os.getenv("PGPORT", "5432"),
+    "NAME": env.str("PGDATABASE", "cmdvault"),
+    "USER": env.str("PGUSER", "cmdvault"),
+    "PASSWORD": env.str("PGPASSWORD", ""),
+    "HOST": env.str("PGHOST", "127.0.0.1"),
+    "PORT": env.int("PGPORT", "5432"),
     "CONN_MAX_AGE": 0,
 }}
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
@@ -49,11 +53,19 @@ LOGIN_WINDOW_SECONDS = 300
 if DEVICE_TOKEN_DAYS < 1 or LOGIN_LIMIT < 1:
     raise ValueError("DEVICE_TOKEN_DAYS and LOGIN_LIMIT must be positive")
 # Only synthetic encrypted data until client encryption/recovery/filtering is ready.
-SYNC_ENABLED = os.getenv("SYNC_ENABLED", "false").lower() == "true"
-TRUST_PROXY = os.getenv("TRUST_PROXY", "false").lower() == "true"
+SYNC_ENABLED = env.bool("SYNC_ENABLED", False) == True
+TRUST_PROXY = env.bool("TRUST_PROXY", default=False)
+
 if TRUST_PROXY:
-    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-SECURE_SSL_REDIRECT = os.getenv("SECURE_SSL_REDIRECT", "true").lower() == "true"
+    SECURE_PROXY_SSL_HEADER = (
+        "HTTP_X_FORWARDED_PROTO",
+        "https",
+    )
+
+SECURE_SSL_REDIRECT = env.bool(
+    "SECURE_SSL_REDIRECT",
+    default=True,
+)
 SECURE_HSTS_SECONDS = 31536000 if SECURE_SSL_REDIRECT else 0
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SESSION_COOKIE_SECURE = True
