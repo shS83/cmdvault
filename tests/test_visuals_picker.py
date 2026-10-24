@@ -1,5 +1,6 @@
 """Exercise real fzf without needing a GUI or claiming GPU compatibility."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import select
@@ -17,6 +18,51 @@ ROOT = Path(__file__).resolve().parents[1]
 @unittest.skipUnless(os.name == 'posix' and shutil.which('fzf') and importlib.util.find_spec('PIL'),
                      'real fzf integration requires POSIX, fzf and optional Pillow')
 class NeonPickerTests(unittest.TestCase):
+    def test_running_sync_error_opens_modal(self):
+        import fcntl
+        import pty
+        import termios
+        with tempfile.TemporaryDirectory() as folder:
+            status_file = Path(folder) / 'status.json'
+            pid, fd = pty.fork()
+            if pid == 0:
+                from src.visuals.config import VisualConfig
+                from src.visuals.picker import run_picker
+                env = dict(os.environ, TERM='xterm-kitty',
+                           CMDVAULT_SYNC_STATUS_FILE=str(status_file))
+                run_picker([shutil.which('fzf'), '--ansi', '--layout=reverse',
+                            '--prompt=vault › '], input='0\trow\n', env=env,
+                           config=VisualConfig(animation=False))
+                os._exit(0)
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 800, 480))
+            data = b''
+            wrote_error = False
+            deadline = time.monotonic() + 10
+            try:
+                while time.monotonic() < deadline:
+                    readable, _, _ = select.select([fd], [], [], .05)
+                    if readable:
+                        try:
+                            chunk = os.read(fd, 65536)
+                        except OSError:
+                            break
+                        data += chunk
+                        if b'\x1b[6n' in chunk:
+                            os.write(fd, b'\x1b[1;1R')
+                    if not wrote_error and b'vault' in data:
+                        status_file.write_text(json.dumps({
+                            'state': 'error', 'message': 'Cloud Sync: error: test detail'}))
+                        wrote_error = True
+                    if b'Cloud Sync: error: test detail' in data:
+                        break
+                self.assertTrue(wrote_error)
+                self.assertIn(b'Cloud Sync: error: test detail', data)
+                self.assertIn(b'ERROR', data)
+            finally:
+                os.kill(pid, signal.SIGTERM)
+                os.waitpid(pid, 0)
+                os.close(fd)
+
     def exercise(self, keys, expected_status, expected_text, animation=False):
         import fcntl
         import pty

@@ -347,6 +347,11 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                             if state in PULSE_LABEL_COLORS:
                                 pulse.set_state(state)
                                 pulse_needs_draw = True
+                            if state == "error":
+                                error_text = str(status.get("message") or "Cloud Sync failed without an error message")[:16384]
+                                error_scroll = 0
+                                error_visible = True
+                                error_drawn = False
                     except (OSError, ValueError, TypeError):
                         pass
                 if resized:
@@ -368,6 +373,11 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                     if error_visible:
                         if keys in (b"\x1b", b"\r", b"\n", b"\x08"):
                             error_visible = False
+                            emit('\x1b[2J\x1b[H')
+                            decoration.key = None
+                            upload = decoration.upload(xp or columns*8, yp or rows*16,
+                                                       columns, rows, animate=False)
+                            pulse.clear()
                             write_all(master, b"\x0c")
                             heading_dirty = pulse_needs_draw = ready_to_place = True
                             last_output = time.monotonic()

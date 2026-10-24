@@ -389,7 +389,7 @@ def _cv_sync_worker(db_path, history_path, status_file):
             history_path=history_path or Path(os.environ.get("HISTFILE") or Path.home() / ".bash_history"),
             favorites_path=favorites_path(), priority_path=priority_path(),
             get_phrase=lambda prompt: (_ for _ in ()).throw(ValueError(
-                "Configure CMDVAULT_SYNC_KEY_FILE before Ctrl-R; interactive key entry would hide the UI")))
+                "Configure CMD_SYNC_KEY or CMDVAULT_SYNC_KEY_FILE before Ctrl-R; interactive key entry would hide the UI")))
         imported = result.get("imported") or {}
         text = (f"Cloud Sync: staged {imported.get('newly_approved', 0)}, "
                 f"excluded {imported.get('excluded', 0)}, pushed {result['pushed']}, "
@@ -532,7 +532,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 				try:
 					# Do not block fzf with an interactive getpass prompt.
 					if not (os.environ.get("CMDVAULT_SYNC_KEY_FILE") or os.environ.get("CMD_SYNC_KEY")):
-						raise ValueError("Set CMDVAULT_SYNC_KEY_FILE to a private passphrase file first")
+						raise ValueError("Set CMD_SYNC_KEY (or CMDVAULT_SYNC_KEY_FILE) before Ctrl-R")
 					stage_current_approved_metadata()
 					root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
 					db_path = root / "cmdvault/favorites.sync.sqlite3"
