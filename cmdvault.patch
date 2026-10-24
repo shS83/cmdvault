@@ -1,0 +1,24 @@
+--- a/cmdvault
++++ b/cmdvault
+@@ -224,12 +224,20 @@
+     while True:
+         rows = ''.join(entry_row(index, entry) for index, entry in enumerate(entries))
+         warnings = sum(bool(entry.secrets) for entry in entries)
++        # Errors too long for the bottom status area open a readable dialog.
++        # Keep the short status string, never truncate the actual message.
++        message = notice.strip()
++        modal = message.lower().startswith(("error", "cloud sync: error", "save failed", "deletion failed")) and len(message) > 65
++        env.pop("CMDVAULT_ERROR_MODAL", None)
++        if modal and neon_picker:
++            env["CMDVAULT_ERROR_MODAL"] = message
++        visible_notice = ("\nError — see dialog (ESC to close)." if modal and neon_picker else notice)
+         result = invoke(
+             [fzf, *fzf_options(detect(sys.stderr).truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--no-multi", "--layout=reverse",
+              "--padding=0,3,0,3", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
+              "--border-label= CMDVAULT / " + ("FAVORITES " if favorites_only else "HISTORY "),
+              "--header=ENTER " + enter_action + " · CTRL-S / ALT-F save favorite (stay open) · CTRL-D delete permanently · CTRL-Y copy · ESC cancel" +
+-             f"\n{warnings} possible secret(s): red rows first. Review and use CTRL-D to remove." + notice,
++             f"\n{warnings} possible secret(s): red rows first. Review and use CTRL-D to remove." + visible_notice,
+              "--sync", "--with-shell=bash -c",
+              "--bind=result:last+pos(" + str(position) + ")+unbind(result)",
+              '--bind=focus:execute-silent(printf "%s" "$FZF_POS" > "$CMDVAULT_POSITION_FILE")',
