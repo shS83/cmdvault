@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 
 # The installer places the same package beside the executable.
 from src.sync.favorites import FavoritesBridge
@@ -309,13 +310,34 @@ def entries_from_current(entries):
 											e.priority if e.priority is not None else 0, -e.recent))
 
 
+HOST_COLORS = {
+    "ALPHATAURI": (0, 229, 255),   # electric cyan
+    "EPSILONTAURI": (255, 79, 216), # synthwave pink
+    "THETATAURI": (184, 255, 77),  # laser lime
+    "OUROBOROS": (179, 136, 255),   # lavender
+}
+
+
+def colored_hosts(hosts):
+    """Color only host labels, not the executable command or warning status."""
+    if not hosts:
+        return ""
+    labels = []
+    for host in hosts:
+        host = str(host).upper()
+        rgb = HOST_COLORS.get(host, (255, 194, 102))
+        label = "\x1b[38;2;%d;%d;%dm%s\x1b[0m" % (*rgb, host)
+        labels.append(label)
+    return "[" + ", ".join(labels) + "] "
+
+
 def entry_row(index, entry):
-	color = '\x1b[31m' if entry.secrets else '\x1b[32m' if entry.priority is not None else '\x1b[33m' if entry.favorite else ''
-	warning = '[POSSIBLE SECRET: ' + ', '.join(entry.secrets) + '] ' if entry.secrets else ''
-	hosts = '[' + ', '.join(entry.hosts) + '] ' if entry.hosts else ''
-	return (f'{index}\t{color}{warning}' +
-			f"{'◆' if entry.priority is not None else '★' if entry.favorite else '·'}  {entry.count:>4}x  {hosts}{display(entry.command)}" +
-			('\x1b[0m' if color else '') + '\n')
+    color = '\x1b[31m' if entry.secrets else '\x1b[32m' if entry.priority is not None else '\x1b[33m' if entry.favorite else ''
+    warning = '[POSSIBLE SECRET: ' + ', '.join(entry.secrets) + '] ' if entry.secrets else ''
+    symbol = '◆' if entry.priority is not None else '★' if entry.favorite else '·'
+    return (f'{index}\t{color}{warning}{symbol}  {entry.count:>4}x  '
+            + display(entry.command)
+            + ('\x1b[0m' if color else '') + '\n')
 
 
 def confirm_delete(command, terminal="/dev/tty"):
@@ -355,6 +377,35 @@ def _cv_confirm_batch_delete(count, terminal="/dev/tty"):
 		return source.readline().strip().lower() == "y"
 
 
+def _cv_sync_worker(db_path, history_path, status_file):
+    """Network work only; never touches fzf or the controlling terminal."""
+    try:
+        from src.sync.interactive import sync_now
+        from src.sync.store import LocalStore
+        db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with LocalStore(db_path):
+            pass
+        result = sync_now(db_path,
+            history_path=history_path or Path(os.environ.get("HISTFILE") or Path.home() / ".bash_history"),
+            favorites_path=favorites_path(), priority_path=priority_path(),
+            get_phrase=lambda prompt: (_ for _ in ()).throw(ValueError(
+                "Configure CMDVAULT_SYNC_KEY_FILE before Ctrl-R; interactive key entry would hide the UI")))
+        imported = result.get("imported") or {}
+        text = (f"Cloud Sync: staged {imported.get('newly_approved', 0)}, "
+                f"excluded {imported.get('excluded', 0)}, pushed {result['pushed']}, "
+                f"received {result['received']}, pending {result['pending']}.")
+        _cv_write_sync_status(status_file, "synced", text)
+    except Exception as exc:
+        _cv_write_sync_status(status_file, "error", "Cloud Sync: error: " + str(exc))
+
+
+def _cv_write_sync_status(path, state, message=""):
+    """Atomic progress indicator shared with the terminal renderer."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"state": state, "message": message}), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def pick_loop(entries, query, favorites_only, enter_action, history_path, position_path):
 	local_entries = entries
 	global_entries = None
@@ -383,12 +434,28 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 	def invoke(argv, **kwargs):
 		if neon_picker:
 			argv = [arg for arg in argv if not arg.startswith(("--height=", "--border=", "--border-label="))]
-			argv += ["--no-clear", "--height=100%", "--border=none", "--margin=1,1"]
+			argv += ["--no-clear", "--height=100%", "--border=none", "--margin=1,0,0,0"]
 			return run_picker(argv, input=kwargs["input"], env=kwargs["env"], config=_VISUAL_CONFIG)
 		return subprocess.run(argv, **kwargs)
 	notice = ""
+	_sync_thread = None
+	_sync_status_file = position_path.parent / "cmdvault-sync-ui-status.json"
+	try:
+		_sync_status_file.unlink(missing_ok=True)
+	except OSError:
+		pass
+	env["CMDVAULT_SYNC_STATUS_FILE"] = str(_sync_status_file)
 	view = "favorites" if favorites_only else "local"
 	while True:
+		if _sync_thread is not None and not _sync_thread.is_alive():
+			_sync_thread.join()
+			_sync_thread = None
+			try:
+				state = json.loads(_sync_status_file.read_text(encoding="utf-8"))
+				notice = "\n" + state.get("message", "")
+			except (OSError, ValueError):
+				pass
+			global_entries = None
 		if view == "global":
 			if global_entries is None:
 				root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
@@ -422,9 +489,9 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 		# Full command preview is intentionally separate from the one-line fzf row.
 		# Only the stable numeric row ID is handed to the preview renderer.
 		preview_file = position_path.parent / "commands-preview.json"
-		preview_file.write_text(json.dumps([item.command for item in entries], ensure_ascii=False), encoding="utf-8")
+		preview_file.write_text(json.dumps([{"command": item.command, "hosts": list(item.hosts) if view == "global" else []} for item in entries], ensure_ascii=False), encoding="utf-8")
 		preview_cmd = ("python3 " + shlex.quote(str(Path(__file__).resolve().parent / "src/visuals/command_preview.py"))
-			+ " " + shlex.quote(str(preview_file)) + " {}")
+			+ " " + shlex.quote(str(preview_file)) + " {1}")
 		result = invoke(
 			[fzf, *fzf_options(detect(sys.stderr).truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--multi", "--bind=ctrl-space:toggle-down", "--layout=reverse",
 			 "--preview=" + preview_cmd, "--preview-window=right:60%:wrap:hidden",
@@ -459,22 +526,24 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 		selected_rows = lines[2:]
 
 		if key == "ctrl-r":
-			try:
-				stage_current_approved_metadata()
-				from src.sync.interactive import sync_now
-				root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
-				db_path = root / "cmdvault/favorites.sync.sqlite3"
-				db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-				from src.sync.store import LocalStore
-				with LocalStore(db_path):
-					pass
-				result = sync_now(db_path,
-                    history_path=history_path or Path(os.environ.get("HISTFILE") or Path.home() / ".bash_history"),
-                    favorites_path=favorites_path(), priority_path=priority_path())
-				global_entries = None
-				notice = f"\nCloud Sync: staged {result['imported']['newly_approved']}, excluded {result['imported']['excluded']}, pushed {result['pushed']}, received {result['received']}, pending {result['pending']}."
-			except (Exception,) as error:
-				notice = "\nCloud Sync: error: " + display(str(error))
+			if _sync_thread is not None and _sync_thread.is_alive():
+				notice = "\nCloud Sync already running."
+			else:
+				try:
+					# Do not block fzf with an interactive getpass prompt.
+					if not (os.environ.get("CMDVAULT_SYNC_KEY_FILE") or os.environ.get("CMD_SYNC_KEY")):
+						raise ValueError("Set CMDVAULT_SYNC_KEY_FILE to a private passphrase file first")
+					stage_current_approved_metadata()
+					root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+					db_path = root / "cmdvault/favorites.sync.sqlite3"
+					_cv_write_sync_status(_sync_status_file, "syncing", "Cloud Sync in progress")
+					_sync_thread = threading.Thread(target=_cv_sync_worker,
+						args=(db_path, history_path, _sync_status_file), daemon=False)
+					_sync_thread.start()
+					notice = "\nCloud Sync running in background…"
+				except Exception as error:
+					notice = "\nCloud Sync: error: " + display(str(error))
+					_cv_write_sync_status(_sync_status_file, "error", notice)
 			position = 1
 			continue
 		# Näkymää voi vaihtaa ilman valittua komentoa.

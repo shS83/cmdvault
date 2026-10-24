@@ -4,6 +4,8 @@ fzf still handles every key and search operation. Its stdin/stdout are files;
 its controlling terminal is a private PTY. The parent alone writes /dev/tty.
 """
 import errno
+import json
+from pathlib import Path
 import fcntl
 import os
 import select
@@ -52,18 +54,22 @@ def with_pulse_margin(argv: Sequence[str], rows: int, columns: int) -> list[str]
     if rows < 14 or columns < 32:
         return arguments
     for i, option in enumerate(arguments):
-        if option.startswith('--margin='):
-            parts = option.split('=', 1)[1].split(',')
-            if len(parts) == 4:
-                parts[2] = str(max(PULSE_RESERVED_ROWS, int(parts[2]) if parts[2].isdigit() else 0))
-                arguments[i] = '--margin=' + ','.join(parts)
-                return arguments
-        elif option == '--margin' and i + 1 < len(arguments):
-            parts = arguments[i + 1].split(',')
-            if len(parts) == 4:
-                parts[2] = str(max(PULSE_RESERVED_ROWS, int(parts[2]) if parts[2].isdigit() else 0))
-                arguments[i + 1] = ','.join(parts)
-                return arguments
+        value_index = i + 1 if option == '--margin' else i
+        if option != '--margin' and not option.startswith('--margin='):
+            continue
+        if value_index >= len(arguments):
+            continue
+        value = arguments[value_index] if option == '--margin' else option.split('=', 1)[1]
+        parts = value.split(',')
+        if len(parts) not in (1, 2, 4):
+            continue
+        if len(parts) == 1:
+            parts *= 4
+        elif len(parts) == 2:
+            parts = [parts[0], parts[1], parts[0], parts[1]]
+        parts[2] = str(max(PULSE_RESERVED_ROWS, int(parts[2]) if parts[2].isdigit() else 0))
+        arguments[value_index] = ','.join(parts) if option == '--margin' else '--margin=' + ','.join(parts)
+        return arguments
     arguments.append(f'--margin=0,0,{PULSE_RESERVED_ROWS},0')
     return arguments
 
@@ -113,16 +119,14 @@ def top_banner_packet(columns: int, rows: int, version: str) -> str:
     """Draw text in fzf's deliberately reserved top margin."""
     if columns < 40 or rows < 14:
         return ''
-    left = f"CMDVAULT v{version}"
+    left = ""
     right = "CTRL-H for help"
     inner = max(0, columns - 8)
     left = left[:max(0, inner - len(right) - 2)]
     gap = max(2, inner - len(left) - len(right))
     header = (left + ' ' * gap + right)[:inner]
     return ('\x1b7\x1b[48;2;11;8;18m\x1b[38;2;195;150;245m'
-            + f'\x1b[2;5H{header}'
-            + f'\x1b[3;5H' + '─' * inner
-            + '\x1b[0m\x1b8')
+            + f'\x1b[1;5H{header}' + '\x1b[0m\x1b8')
 
 
 def help_modal_packet(columns: int, rows: int, enter_action: str = 'run') -> str:
@@ -287,6 +291,8 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
     error_scroll = 0
     error_drawn = False
     heading_version = env.get("CMDVAULT_VERSION", "0.1.7")
+    sync_status_path = env.get("CMDVAULT_SYNC_STATUS_FILE")
+    sync_status_last = None
     enter_action = env.get("CMDVAULT_ENTER_ACTION", "run")
     heading_dirty = True
 
@@ -331,6 +337,18 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
             ready_to_place = False
             last_output = time.monotonic()
             while True:
+                if sync_status_path:
+                    try:
+                        status_text = Path(sync_status_path).read_text(encoding="utf-8")
+                        if status_text != sync_status_last:
+                            sync_status_last = status_text
+                            status = json.loads(status_text)
+                            state = status.get("state", "ready")
+                            if state in PULSE_LABEL_COLORS:
+                                pulse.set_state(state)
+                                pulse_needs_draw = True
+                    except (OSError, ValueError, TypeError):
+                        pass
                 if resized:
                     columns,rows,xp,yp = geometry()
                     if process.poll() is None:
@@ -363,6 +381,13 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                         # A dismissal key refreshes fzf; do not feed it to search.
                         if keys:
                             help_visible = False
+                            emit('\x1b[2J\x1b[H')
+                            # Erasing the text screen can also discard Kitty
+                            # placements, so restore both graphics afterwards.
+                            decoration.key = None
+                            upload = decoration.upload(xp or columns*8, yp or rows*16,
+                                                       columns, rows, animate=False)
+                            pulse.clear()
                             write_all(master, b'\x0c')  # fzf redraw-screen
                             heading_dirty = True
                             pulse_needs_draw = True
