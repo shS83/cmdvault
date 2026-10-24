@@ -16,7 +16,81 @@ import time
 import tty
 from typing import Mapping, Sequence
 from .config import VisualConfig
-from .kitty import KittyDecoration, AnimationLoader
+from .kitty import KittyDecoration, AnimationLoader, KittyPulseOverlay
+import secrets
+
+
+PULSE_RESERVED_ROWS = 5
+PULSE_BG = "\x1b[48;2;11;8;18m"
+
+
+def with_pulse_margin(argv: Sequence[str], rows: int, columns: int) -> list[str]:
+    """Reserve the bottom rows in fzf itself, preserving keyboard navigation.
+
+    fzf must know the reduced result height: hiding its output afterwards loses
+    selections and corrupts scrolling. Keep existing top/side margin settings.
+    """
+    arguments = list(argv)
+    if rows < 14 or columns < 32:
+        return arguments
+    for i, option in enumerate(arguments):
+        if option.startswith('--margin='):
+            parts = option.split('=', 1)[1].split(',')
+            if len(parts) == 4:
+                parts[2] = str(max(PULSE_RESERVED_ROWS, int(parts[2]) if parts[2].isdigit() else 0))
+                arguments[i] = '--margin=' + ','.join(parts)
+                return arguments
+        elif option == '--margin' and i + 1 < len(arguments):
+            parts = arguments[i + 1].split(',')
+            if len(parts) == 4:
+                parts[2] = str(max(PULSE_RESERVED_ROWS, int(parts[2]) if parts[2].isdigit() else 0))
+                arguments[i + 1] = ','.join(parts)
+                return arguments
+    arguments.append(f'--margin=0,0,{PULSE_RESERVED_ROWS},0')
+    return arguments
+
+
+def with_full_command_preview(argv: Sequence[str]) -> list[str]:
+    """Right opens a wrapped full-command preview; Left closes it.
+
+    fzf remains responsible for selection, filtering and keyboard processing.
+    Field 1 is the hidden command identity; fields 2.. are the display text.
+    The placeholder is shell-quoted by fzf, and printf never evaluates commands.
+    """
+    arguments = list(argv)
+    arguments.extend((
+        "--preview", "printf '%s\n' {2..}",
+        "--preview-window", "down:5:hidden:wrap:border-top",
+        "--bind", "right:show-preview,left:hide-preview",
+    ))
+    return arguments
+
+
+def pulse_background_packet(columns: int, rows: int) -> str:
+    """Fill only the interior of fzf's reserved rows, leaving frame margins clear."""
+    if rows < 14 or columns < 32:
+        return ''
+    start_row = max(1, rows - PULSE_RESERVED_ROWS + 1)
+    interior = ' ' * max(0, columns - 4)
+    return ('\x1b7' + PULSE_BG + ''.join(
+        f'\x1b[{row};3H{interior}' for row in range(start_row, rows)
+    ) + '\x1b[0m\x1b8')
+
+
+def pulse_label_packet(columns: int, rows: int, label: str, *, pixel_width: int | None = None, pixel_height: int | None = None, orb_size: int = 104, margin: int = 64) -> str:
+    """A subdued label in the reserved area, never over the fzf results."""
+    if rows < 14 or columns < 32:
+        return ''
+    # Match KittyPulseOverlay pixel placement, not a hard-coded row.
+    pw, ph = pixel_width or columns * 8, pixel_height or rows * 16
+    cw, ch = pw / columns, ph / rows
+    center_x = pw - margin - orb_size / 2
+    center_y = ph - margin - orb_size / 2
+    column = max(3, min(columns - 12, round((center_x - orb_size / 2 - 12 * cw) / cw) + 1))
+    row = max(rows - PULSE_RESERVED_ROWS + 1, min(rows - 1, round(center_y / ch) + 1))
+    return (f'\x1b7\x1b[{row};{column}H' + PULSE_BG +
+            '\x1b[38;2;199;180;216m' + f'{label:>11}' +
+            '\x1b[0m\x1b8')
 
 
 class EscapeBoundary:
@@ -84,6 +158,10 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
     master, slave = os.openpty()
     original = termios.tcgetattr(terminal)
     decoration = KittyDecoration(config)
+    pulse_id = secrets.randbelow(2**31 - 1) + 1
+    while pulse_id == decoration.image_id:
+        pulse_id = secrets.randbelow(2**31 - 1) + 1
+    pulse = KittyPulseOverlay(config, pulse_id)
     process = None
     previous_signal = None
     exit_signals = {}
@@ -92,6 +170,8 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
     screen_entered = False
     loader = None
     animation_geometry = None
+    pulse_geometry = None
+    pulse_needs_draw = True
 
     def resize_signal(signum, frame):
         nonlocal resized
@@ -123,7 +203,8 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
             tty.setraw(terminal)
             emit('\x1b[?1049h\x1b[2J\x1b[H')
             screen_entered = True
-            process = subprocess.Popen(argv,stdin=source,stdout=result,stderr=slave,
+            picker_args = with_pulse_margin(with_full_command_preview(argv), rows, columns)
+            process = subprocess.Popen(picker_args,stdin=source,stdout=result,stderr=slave,
                                        env=env,preexec_fn=child_terminal,close_fds=True)
             os.close(slave)
             slave = -1
@@ -140,6 +221,7 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                     resized = False
                     upload = decoration.upload(xp or columns*8,yp or rows*16,columns,rows,animate=False) or upload
                     ready_to_place = True
+                    pulse_needs_draw = True
                 readable,_,_ = select.select([terminal,master],[],[],
                     .02 if loader and not loader.done.is_set() else .05 if ready_to_place else .25)
                 if terminal in readable:
@@ -164,6 +246,8 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                     if boundary.erasures != previous_erasures:
                         decoration.key = None
                         upload = decoration.upload(xp or columns*8,yp or rows*16,columns,rows,animate=False) or upload
+                        pulse.clear()
+                        pulse_needs_draw = True
                     ready_to_place = True
                     last_output = time.monotonic()
                 if ready_to_place and boundary.safe and time.monotonic()-last_output >= .025:
@@ -176,10 +260,30 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                             loader = AnimationLoader(decoration,xp or columns*8,yp or rows*16,columns,rows)
                         animation_geometry = geometry_key
                     emit(upload + decoration.place(columns,rows))
+                    # The parent is the only terminal writer. Place the overlay
+                    # only after fzf's complete escape sequence and redraw.
+                    pulse_needs_draw = True
                     upload = ''
                     ready_to_place = False
                 if loader and boundary.safe and not upload:
                     emit(loader.drain())
+                if boundary.safe and not ready_to_place and not upload:
+                    location = (columns, rows, xp, yp)
+                    if location != pulse_geometry:
+                        pulse_needs_draw = True
+                        pulse_geometry = location
+                    packet = pulse.packet(
+                        columns, rows, now=time.monotonic(),
+                        force=pulse_needs_draw,
+                        pixel_width=xp or columns * 8,
+                        pixel_height=yp or rows * 16,
+                    )
+                    if pulse_needs_draw:
+                        emit(pulse_background_packet(columns, rows))
+                        emit(pulse_label_packet(columns, rows, pulse.label, pixel_width=xp or columns * 8, pixel_height=yp or rows * 16, orb_size=pulse.pulse.style.size))
+                    if packet:
+                        emit(packet)
+                    pulse_needs_draw = False
                 if process.poll() is not None and master not in readable:
                     break
             code = process.wait()
@@ -201,7 +305,7 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                 process.wait()
         try:
             if screen_entered:
-                emit(decoration.delete()+'\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?2004l\x1b[?7h\x1b[0m\x1b[?25h\x1b[?1049l')
+                emit(pulse.clear()+decoration.delete()+'\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?2004l\x1b[?7h\x1b[0m\x1b[?25h\x1b[?1049l')
         finally:
             termios.tcsetattr(terminal,termios.TCSANOW,original)
             os.close(terminal)

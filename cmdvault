@@ -226,7 +226,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
         warnings = sum(bool(entry.secrets) for entry in entries)
         result = invoke(
             [fzf, *fzf_options(detect(sys.stderr).truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--no-multi", "--layout=reverse",
-             "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
+             "--padding=0,3,0,3", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
              "--border-label= CMDVAULT / " + ("FAVORITES " if favorites_only else "HISTORY "),
              "--header=ENTER " + enter_action + " · CTRL-S / ALT-F save favorite (stay open) · CTRL-D delete permanently · CTRL-Y copy · ESC cancel" +
              f"\n{warnings} possible secret(s): red rows first. Review and use CTRL-D to remove." + notice,
