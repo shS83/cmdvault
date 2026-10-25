@@ -37,6 +37,23 @@ class VisualTests(unittest.TestCase):
         self.assertEqual(select('kitty', caps)[0], 'ansi')
         self.assertIn('unavailable', select('kitty', caps)[1])
 
+    def test_explicit_sixel_on_windows_terminal(self):
+        caps = detect(Terminal(), {'TERM': 'xterm-256color', 'WT_SESSION': 'test'})
+        self.assertFalse(caps.sixel)
+        self.assertEqual(select('sixel', caps, raster_layout=True), ('sixel', ''))
+        self.assertEqual(select('sixel', caps)[0], 'ansi')
+        self.assertEqual(select('sixel', detect(io.StringIO(), {}), raster_layout=True)[0], 'ansi')
+
+    def test_sixel_diagnostics_report_selected_backend(self):
+        output = Terminal()
+        caps = Capabilities(True, 'xterm-256color')
+        with patch('src.visuals.diagnostics.SixelRenderer') as renderer:
+            run(VisualConfig(renderer='sixel', animation=False), output, caps=caps)
+        lines = renderer.return_value.draw.call_args.args[0]
+        self.assertIn('Backend: sixel', lines)
+        self.assertIn('Explicit SIXEL selection', lines)
+        self.assertNotIn('fallback', ' '.join(lines).lower())
+
     def test_non_tty(self):
         output = io.StringIO()
         run(VisualConfig(), output)
@@ -86,6 +103,69 @@ class VisualTests(unittest.TestCase):
         self.assertIn('#15`', encoded)
         self.assertTrue(encoded.endswith('\x1b\\'))
         self.assertIn('-',encode_sixel(1,7,b'\xff\xff\xff'*7))
+
+    def test_sixel_shared_frame_stays_in_reserved_margins(self):
+        from src.visuals.sixel import sixel_frame_packet, sixel_status_packet
+        packet = sixel_frame_packet(80, 24, 800, 480)
+        self.assertEqual(packet.count('\x1bP0;1;0q'), 4)
+        for position in ('1;1', '23;1', '2;1', '2;79'):
+            self.assertIn('\x1b[' + position + 'H', packet)
+        orb = sixel_status_packet(80, 24, 'synced', 800, 480)
+        self.assertIn('STATUS: SYNCED', orb)
+        self.assertIn('"1;1;104;104', orb)
+        self.assertNotIn('\x1b_G', packet + orb)
+
+    def test_sixel_frame_never_reaches_scrolling_boundary(self):
+        import re
+        from src.visuals.sixel import sixel_frame_packet, sixel_status_packet
+        # 16/20/22px cells expose padding to the next six-pixel band.
+        for ch in (16, 20, 22, 24, 30):
+            for columns, rows in ((80, 24), (90, 28), (40, 14)):
+                packet = sixel_frame_packet(columns, rows, columns*10, rows*ch)
+                packet += sixel_status_packet(columns, rows, 'ready', columns*10, rows*ch)
+                images = re.findall(r'\x1b\[(\d+);(\d+)H\x1bP0;1;0q"1;1;(\d+);(\d+)(.*?)\x1b\\', packet, re.S)
+                self.assertEqual(len(images), 5)
+                for row, col, width, height, data in images:
+                    # Model SIXEL band consumption, not just the declared size.
+                    bands = data.count('-') + 1
+                    self.assertEqual(bands, (int(height)+5)//6)
+                    end_y = (int(row)-1)*ch + bands*6
+                    self.assertLessEqual(end_y, (rows-1)*ch)
+                    self.assertLessEqual((int(col)-1)*10 + int(width), columns*10)
+
+    def test_sixel_footer_text_never_erases_bottom_neon_row(self):
+        from src.visuals.picker import pulse_background_packet, ansi_status_packet
+        from src.visuals.sixel import footer_rows
+        import re
+        for rows in (14, 24, 28, 40):
+            packet = pulse_background_packet(80, rows,
+                       reserved_rows=footer_rows(rows), frame_rows=2)
+            for state in ('ready', 'syncing', 'synced', 'error', 'offline'):
+                packet += ansi_status_packet(80, rows, state, footer_inset=2)
+            text_rows = [int(row) for row in re.findall(r'\x1b\[(\d+);\d+H', packet)]
+            self.assertTrue(text_rows)
+            self.assertGreaterEqual(min(text_rows), rows-footer_rows(rows)+1)
+            self.assertLess(max(text_rows), rows-1)
+
+    def test_sixel_encoder_preserves_rgb_palette(self):
+        from PIL import Image
+        from src.visuals.sixel import encode_image
+        encoded = encode_image(Image.new('RGB', (8, 6), (0, 255, 0)))
+        self.assertIn(';2;0;100;0', encoded)
+        self.assertIn('!8~', encoded)
+
+    def test_terminal_pixel_reports_preserve_keyboard_input(self):
+        from src.visuals.geometry import PixelReports
+        reports = PixelReports()
+        self.assertEqual(reports.feed(b'query\x1b[6;24;'), b'query')
+        self.assertEqual(reports.feed(b'12tmore\x1b[4;720;1200t'), b'more')
+        self.assertEqual(reports.pixels(100, 30), (1200, 720))
+        self.assertEqual(reports.pixels(80, 24), (960, 576))
+        self.assertEqual(reports.feed(b'\x1b[A\x1b[B'), b'\x1b[A\x1b[B')
+        self.assertEqual(reports.feed(b'\x1b'), b'')
+        self.assertEqual(reports.flush(), b'\x1b')
+        self.assertEqual(reports.feed(b'\x1b[6;0;0t'), b'')
+        self.assertEqual(reports.pixels(80, 24), (960, 576))
 
     def test_clock(self):
         clock = FrameClock(12)

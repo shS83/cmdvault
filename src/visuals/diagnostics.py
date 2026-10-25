@@ -1,4 +1,4 @@
-"""A short, self-cleaning test frame; no terminal input is read."""
+"""A short, self-cleaning test frame with bounded SIXEL pixel-size queries."""
 import shutil
 import time
 from .ansi import AnsiRenderer
@@ -15,7 +15,10 @@ def run(config, output, *, caps=None, duration=2.0):
         except ImportError:
             backend, notice = "ansi", "Pillow unavailable; using ANSI"
     size = shutil.get_terminal_size((80,24))
-    lines = ["cmdvault Neon", f"Terminal: {caps.term}", f"Backend: {backend}; fallback: ANSI", f"Theme: {config.theme}; glow: {config.glow:.0%}", f"Animation: {config.animation}; target: {config.fps} FPS", f"Dimensions: {size.columns} x {size.lines}", notice or caps.reason]
+    detail = notice or ("Explicit SIXEL selection" if backend == "sixel" else
+                        "Direct Kitty session" if backend == "kitty" else
+                        "ANSI selected" if config.renderer == "ansi" else caps.reason)
+    lines = ["cmdvault Neon", f"Terminal: {caps.term}", f"Backend: {backend}", f"Theme: {config.theme}; glow: {config.glow:.0%}", f"Animation: {config.animation}; target: {config.fps} FPS", f"Dimensions: {size.columns} x {size.lines}", detail]
     renderer = {"ansi": AnsiRenderer, "kitty": KittyRenderer, "sixel": SixelRenderer}[backend](output, config, caps)
     if not caps.tty:
         renderer.draw(lines)

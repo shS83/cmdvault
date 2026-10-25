@@ -411,7 +411,9 @@ def _cv_sync_worker(db_path, history_path, status_file):
                 f"received {result['received']}, pending {result['pending']}.")
         _cv_write_sync_status(status_file, "synced", text)
     except Exception as exc:
-        _cv_write_sync_status(status_file, "error", "Cloud Sync: error: " + str(exc))
+        from src.sync.client import SyncHTTPError
+        state = "offline" if isinstance(exc, SyncHTTPError) and exc.code == "offline" else "error"
+        _cv_write_sync_status(status_file, state, "Cloud Sync: error: " + str(exc))
 
 
 def _cv_write_sync_status(path, state, message=""):
@@ -434,23 +436,27 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 	position = 1
 	caps = detect(sys.stderr)
 	backend, fallback_notice = select(_VISUAL_CONFIG.renderer, caps, raster_layout=True)
-	if backend == "kitty":
+	if backend in ("kitty", "sixel"):
 		try:
 			import PIL
 		except ImportError:
 			backend = "ansi"
-			fallback_notice = "Kitty graphics needs Pillow: uv sync --extra graphics; using ANSI."
+			fallback_notice = "Raster graphics needs Pillow: uv sync --extra graphics; using ANSI."
 	if fallback_notice:
 		print("cmdvault: " + fallback_notice, file=sys.stderr)
 	neon_picker = backend == "kitty" and sys.stdin.isatty()
 	if neon_picker:
 		dimensions = shutil.get_terminal_size((80, 24))
 		neon_picker = dimensions.columns >= 32 and dimensions.lines >= 10
+	terminal_picker = sys.stdin.isatty() and backend in ("ansi", "kitty", "sixel")
 	def invoke(argv, **kwargs):
-		if neon_picker:
-			argv = [arg for arg in argv if not arg.startswith(("--height=", "--border=", "--border-label="))]
-			argv += ["--no-clear", "--height=100%", "--border=none", "--margin=1,0,0,0"]
-			return run_picker(argv, input=kwargs["input"], env=kwargs["env"], config=_VISUAL_CONFIG)
+		if terminal_picker:
+			removed = ("--height=", "--border=", "--border-label=") if neon_picker or backend == "sixel" else ("--height=",)
+			argv = [arg for arg in argv if not arg.startswith(removed)]
+			argv += ["--no-clear", "--height=100%", ("--margin=1,2,0,2" if backend == "sixel" else "--margin=1,0,0,0")]
+			if neon_picker or backend == "sixel":
+				argv += ["--border=none"]
+			return run_picker(argv, input=kwargs["input"], env=kwargs["env"], config=_VISUAL_CONFIG, graphics=neon_picker, sixel=backend == "sixel")
 		return subprocess.run(argv, **kwargs)
 	notice = ""
 	_sync_thread = None
@@ -460,6 +466,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 	except OSError:
 		pass
 	env["CMDVAULT_SYNC_STATUS_FILE"] = str(_sync_status_file)
+	_cv_write_sync_status(_sync_status_file, "ready")
 	view = "favorites" if favorites_only else "local"
 	sort_mode = 0
 	while True:
@@ -500,9 +507,9 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 		message = notice.strip()
 		modal = message.lower().startswith(("error", "cloud sync: error", "save failed", "deletion failed"))
 		env.pop("CMDVAULT_ERROR_MODAL", None)
-		if modal and neon_picker:
+		if modal and terminal_picker:
 			env["CMDVAULT_ERROR_MODAL"] = message
-		visible_notice = ("\nError — see dialog (ESC to close)." if modal and neon_picker else notice)
+		visible_notice = ("\nError — see dialog (ESC to close)." if modal and terminal_picker else notice)
 		# Full command preview is intentionally separate from the one-line fzf row.
 		# Only the stable numeric row ID is handed to the preview renderer.
 		preview_file = position_path.parent / "commands-preview.json"
@@ -510,7 +517,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 		preview_cmd = ("python3 " + shlex.quote(str(Path(__file__).resolve().parent / "src/visuals/command_preview.py"))
 			+ " " + shlex.quote(str(preview_file)) + " {1}")
 		result = invoke(
-			[fzf, *fzf_options(detect(sys.stderr).truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--multi", "--bind=ctrl-space:toggle-down", "--layout=reverse",
+			[fzf, *fzf_options(backend in ("kitty", "sixel") or caps.truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--multi", "--bind=ctrl-space:toggle-down", "--layout=reverse",
 			 "--preview=" + preview_cmd, "--preview-window=right:60%:wrap:hidden",
 			 "--bind=right:show-preview,left:hide-preview,ctrl-o:toggle-preview,alt-right:preview-page-down,alt-left:preview-page-up,pgup:preview-page-up,pgdn:preview-page-down",
 			 "--padding=0,2,0,2", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",

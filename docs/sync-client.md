@@ -102,3 +102,30 @@ operation in the picker and the existing graphics/keyboard behavior is unchanged
 For developers, run `uv sync --extra graphics` and
 `uv run --extra graphics python -m unittest discover -s tests -v` from the
 repository root. Tests never contact the deployed service or a user's history.
+
+
+## Ctrl-R in the picker
+
+After importing the sealed key and logging in, configure a private file containing
+its **passphrase** (not the exported JSON key) before launching the picker:
+
+```bash
+chmod 600 ~/sync.key
+export CMDVAULT_SYNC_KEY_FILE="$HOME/sync.key"
+cmdvault
+```
+
+Add the export to `~/.bashrc` to retain it for future shells. Creating the file
+alone does not configure the picker. Ctrl-R starts background synchronization;
+the ANSI footer displays `STATUS: READY`, `SYNCING`, `SYNCED`, `OFFLINE`, or `ERROR` and
+updates without another keypress. Errors open a scrollable dialog. `READY` means
+no synchronization has completed in this picker session.
+
+
+Windows Terminal with SIXEL support can use `cmdvault --graphics sixel` (also in
+WSL). The explicit option enables SIXEL even when `TERM=xterm-256color` does not
+advertise it. `--graphics auto` keeps passive detection. SIXEL uses the same neon frame and sync sphere artwork as Kitty, with an RGB
+palette and a larger reserved footer. The frame and sphere are static and redraw
+after text updates or state changes; the live status label and error modals also
+remain available. It requires Pillow; no chafa or ffmpeg process is needed.
+Use `cmdvault --graphics sixel --graphics-test` for a local rendering check.
