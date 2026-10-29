@@ -1,6 +1,6 @@
 [project]
 name = "cmdvault"
-version = "0.1.7"
+version = "0.2.0"
 description = "Find and keep useful commands from Bash history"
 requires-python = ">=3.9"
 dependencies = [

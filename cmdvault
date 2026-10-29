@@ -479,7 +479,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			except (OSError, ValueError):
 				pass
 			global_entries = None
-		if view == "global":
+		if view in ("global", "global favorites"):
 			if global_entries is None:
 				root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
 				remote = remote_metadata(root / "cmdvault/favorites.sync.sqlite3")
@@ -500,7 +500,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			entries = local_entries
 		displayed_entries = sorted_entries(entries, SORT_MODES[sort_mode])
 		rows = ''.join(entry_row(index, entry) for index, entry in enumerate(displayed_entries)
-			if view != "favorites" or entry.favorite)
+			if view not in ("favorites", "global favorites") or entry.favorite or entry.priority is not None)
 		warnings = sum(bool(entry.secrets) for entry in entries)
 		# Errors too long for the bottom status area open a readable dialog.
 		# Keep the short status string, never truncate the actual message.
@@ -513,7 +513,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 		# Full command preview is intentionally separate from the one-line fzf row.
 		# Only the stable numeric row ID is handed to the preview renderer.
 		preview_file = position_path.parent / "commands-preview.json"
-		preview_file.write_text(json.dumps([{"command": item.command, "hosts": list(item.hosts) if view == "global" else []} for item in displayed_entries], ensure_ascii=False), encoding="utf-8")
+		preview_file.write_text(json.dumps([{"command": item.command, "hosts": list(item.hosts) if view in ("global", "global favorites") else []} for item in displayed_entries], ensure_ascii=False), encoding="utf-8")
 		preview_cmd = ("python3 " + shlex.quote(str(Path(__file__).resolve().parent / "src/visuals/command_preview.py"))
 			+ " " + shlex.quote(str(preview_file)) + " {1}")
 		result = invoke(
@@ -522,12 +522,12 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			 "--bind=right:show-preview,left:hide-preview,ctrl-o:toggle-preview,alt-right:preview-page-down,alt-left:preview-page-up,pgup:preview-page-up,pgdn:preview-page-down",
 			 "--padding=0,2,0,2", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
 			 "--border-label= CMDVAULT / " + view.upper() + " / " + SORT_MODES[sort_mode].upper() + " ",
-			 "--header=→ PREVIEW · ← CLOSE · CTRL-O TOGGLE PREVIEW · S SORT · CTRL-G GLOBAL · CTRL-F FAVORITES · CTRL-L LOCAL · CTRL-P PRIORITY · CTRL-R SYNC" +
+			 "--header=→ PREVIEW · ← CLOSE · CTRL-O TOGGLE PREVIEW · S SORT · CTRL-G GLOBAL · SHIFT-ALT-F GLOBAL FAVORITES · CTRL-F FAVORITES · CTRL-L LOCAL · CTRL-P PRIORITY · CTRL-R SYNC" +
 			 f"\n{warnings} possible secret(s): red rows. Review and use CTRL-D to remove." + visible_notice,
 			 "--sync", "--with-shell=bash -c",
 			 "--bind=result:last+pos(" + str(position) + ")+unbind(result)",
 			 '--bind=focus:execute-silent(printf "%s" "$FZF_POS" > "$CMDVAULT_POSITION_FILE")',
-			 "--expect=s,ctrl-s,alt-f,ctrl-y,ctrl-d,ctrl-g,ctrl-f,ctrl-l,ctrl-p,alt-up,alt-down,ctrl-r", "--query=" + query],
+			 "--expect=s,alt-F,ctrl-s,alt-f,ctrl-y,ctrl-d,ctrl-g,ctrl-f,ctrl-l,ctrl-p,alt-up,alt-down,ctrl-r", "--query=" + query],
 			input=rows, capture_output=True, text=True, env=env,
 		)
 		if result.returncode in (1, 130):
@@ -539,7 +539,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 		valid_keys = {
 			"",
 			"ctrl-s", "alt-f", "ctrl-y", "ctrl-d",
-			"ctrl-g", "ctrl-f", "ctrl-l", "ctrl-p",
+			"ctrl-g", "alt-F", "ctrl-f", "ctrl-l", "ctrl-p",
 			"alt-up", "alt-down", "ctrl-r", "s",
 		}
 
@@ -575,9 +575,10 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			position = 1
 			continue
 		# Näkymää voi vaihtaa ilman valittua komentoa.
-		if key in ("ctrl-g", "ctrl-f", "ctrl-l"):
+		if key in ("ctrl-g", "alt-F", "ctrl-f", "ctrl-l"):
 			view = {
 				"ctrl-g": "global",
+				"alt-F": "global favorites",
 				"ctrl-f": "favorites",
 				"ctrl-l": "local",
 				}[key]
@@ -592,11 +593,6 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			continue
 
 		row = selected_rows[0]
-		if key in ("ctrl-g", "ctrl-f", "ctrl-l"):
-			view = {"ctrl-g": "global", "ctrl-f": "favorites", "ctrl-l": "local"}[key]
-			notice = "\nGLOBAL includes downloaded approved commands." if view == "global" else ""
-			position = 1
-			continue
 		try:
 			index = int(row.split("\t", 1)[0])
 			if not 0 <= index < len(displayed_entries):
@@ -623,7 +619,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 				global_entries = None
 				notice = "\nPriority order updated."
 			continue
-		if key == "ctrl-d" and view == "global":
+		if key == "ctrl-d" and view in ("global", "global favorites"):
 			notice = "\nDeletion disabled in GLOBAL; switch to LOCAL (Ctrl-L)."
 			continue
 		if key == "ctrl-d":

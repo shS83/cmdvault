@@ -1,5 +1,6 @@
 # Cmdvault GLOBAL v2 (incremental update)
 
+- Shift+Alt+F shows only favorites and priority favorites from all machines; S cycles the existing sort modes.
 - Ctrl-G shows [HOST] prefixes and merged approved history.
 - Legacy records without a hostname are labeled ALPHATAURI as explicitly requested.
 - Newly approved imports acquire the actual machine hostname.

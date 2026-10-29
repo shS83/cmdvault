@@ -225,6 +225,30 @@ class VaultTests(unittest.TestCase):
 
 
 class PickerRegressionTests(unittest.TestCase):
+    def test_shift_alt_f_filters_all_hosts_and_keeps_sort_and_selection(self):
+        entries = [vault.Entry('local history'), vault.Entry('Zulu local', favorite=True)]
+        remote = {
+            'remote history': dict(favorite=False, priority=None, hosts=('OTHER',), count=2),
+            'Alpha remote': dict(favorite=True, priority=None, hosts=('OTHER',), count=3),
+            'Priority remote': dict(favorite=False, priority=0, hosts=('THIRD',), count=1),
+        }
+        responses = [subprocess.CompletedProcess([], 0, 'query\nalt-F\n', ''),
+                     subprocess.CompletedProcess([], 0, 'query\ns\n', ''),
+                     subprocess.CompletedProcess([], 0, 'query\n\n0\trow\n', '')]
+        with patch.object(vault.shutil, 'which', return_value='fzf'), \
+                patch.object(vault, 'remote_metadata', return_value=remote), \
+                patch.object(vault.subprocess, 'run', side_effect=responses) as run:
+            self.assertEqual(vault.pick(entries, '', False), ('', 'Alpha remote'))
+        for call in run.call_args_list[1:]:
+            rows = call.kwargs['input']
+            self.assertNotIn('history', rows)
+            for command in ('Zulu local', 'Alpha remote', 'Priority remote'):
+                self.assertIn(command, rows)
+            self.assertIn('--query=query', call.args[0])
+            self.assertTrue(any('GLOBAL FAVORITES' in arg for arg in call.args[0]))
+        self.assertIn('Priority remote', run.call_args_list[1].kwargs['input'].splitlines()[0])
+        self.assertIn('Alpha remote', run.call_args.kwargs['input'].splitlines()[0])
+
     def test_s_cycles_sort_and_selects_correct_command(self):
         entries = [vault.Entry('zebra', count=3), vault.Entry('Alpha', count=1)]
         responses = [subprocess.CompletedProcess([], 0, 'Al\ns\n', ''),
