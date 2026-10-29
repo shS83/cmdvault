@@ -519,15 +519,15 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 		result = invoke(
 			[fzf, *fzf_options(backend in ("kitty", "sixel") or caps.truecolor, _VISUAL_CONFIG.glow), "--ansi", "--no-sort", "--delimiter=\t", "--with-nth=2..", "--multi", "--bind=ctrl-space:toggle-down", "--layout=reverse",
 			 "--preview=" + preview_cmd, "--preview-window=right:60%:wrap:hidden",
-			 "--bind=right:show-preview,left:hide-preview,ctrl-o:toggle-preview,alt-right:preview-page-down,alt-left:preview-page-up,pgup:preview-page-up,pgdn:preview-page-down",
+			 "--bind=right:show-preview,left:hide-preview,ctrl-o:toggle-preview,alt-right:preview-page-down,alt-left:preview-page-up,pgup:page-up,pgdn:page-down",
 			 "--padding=0,2,0,2", "--height=90%", "--border=rounded", "--prompt=vault › ", "--print-query",
 			 "--border-label= CMDVAULT / " + view.upper() + " / " + SORT_MODES[sort_mode].upper() + " ",
-			 "--header=→ PREVIEW · ← CLOSE · CTRL-O TOGGLE PREVIEW · S SORT · CTRL-G GLOBAL · SHIFT-ALT-F GLOBAL FAVORITES · CTRL-F FAVORITES · CTRL-L LOCAL · CTRL-P PRIORITY · CTRL-R SYNC" +
+			 "--header=→ PREVIEW · ← CLOSE · CTRL-O TOGGLE PREVIEW · ALT-SHIFT-S SORT · ALT-SHIFT-H HELP · CTRL-G GLOBAL · SHIFT-ALT-F GLOBAL FAVORITES · CTRL-F FAVORITES · CTRL-L LOCAL · CTRL-P PRIORITY · CTRL-R SYNC" +
 			 f"\n{warnings} possible secret(s): red rows. Review and use CTRL-D to remove." + visible_notice,
 			 "--sync", "--with-shell=bash -c",
 			 "--bind=result:last+pos(" + str(position) + ")+unbind(result)",
 			 '--bind=focus:execute-silent(printf "%s" "$FZF_POS" > "$CMDVAULT_POSITION_FILE")',
-			 "--expect=s,alt-F,ctrl-s,alt-f,ctrl-y,ctrl-d,ctrl-g,ctrl-f,ctrl-l,ctrl-p,alt-up,alt-down,ctrl-r", "--query=" + query],
+			 "--expect=alt-S,alt-F,ctrl-s,alt-f,ctrl-y,ctrl-d,ctrl-g,ctrl-f,ctrl-l,ctrl-p,alt-up,alt-down,ctrl-r", "--query=" + query],
 			input=rows, capture_output=True, text=True, env=env,
 		)
 		if result.returncode in (1, 130):
@@ -540,7 +540,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 			"",
 			"ctrl-s", "alt-f", "ctrl-y", "ctrl-d",
 			"ctrl-g", "alt-F", "ctrl-f", "ctrl-l", "ctrl-p",
-			"alt-up", "alt-down", "ctrl-r", "s",
+			"alt-up", "alt-down", "ctrl-r", "alt-S",
 		}
 
 		if len(lines) < 2 or lines[1] not in valid_keys:
@@ -548,7 +548,7 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 
 		query, key = lines[:2]
 		selected_rows = lines[2:]
-		if key == "s":
+		if key == "alt-S":
 			sort_mode = (sort_mode + 1) % len(SORT_MODES)
 			position = 1
 			continue

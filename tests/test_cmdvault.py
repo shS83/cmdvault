@@ -233,7 +233,7 @@ class PickerRegressionTests(unittest.TestCase):
             'Priority remote': dict(favorite=False, priority=0, hosts=('THIRD',), count=1),
         }
         responses = [subprocess.CompletedProcess([], 0, 'query\nalt-F\n', ''),
-                     subprocess.CompletedProcess([], 0, 'query\ns\n', ''),
+                     subprocess.CompletedProcess([], 0, 'query\nalt-S\n', ''),
                      subprocess.CompletedProcess([], 0, 'query\n\n0\trow\n', '')]
         with patch.object(vault.shutil, 'which', return_value='fzf'), \
                 patch.object(vault, 'remote_metadata', return_value=remote), \
@@ -249,9 +249,9 @@ class PickerRegressionTests(unittest.TestCase):
         self.assertIn('Priority remote', run.call_args_list[1].kwargs['input'].splitlines()[0])
         self.assertIn('Alpha remote', run.call_args.kwargs['input'].splitlines()[0])
 
-    def test_s_cycles_sort_and_selects_correct_command(self):
+    def test_alt_shift_s_cycles_sort_and_selects_correct_command(self):
         entries = [vault.Entry('zebra', count=3), vault.Entry('Alpha', count=1)]
-        responses = [subprocess.CompletedProcess([], 0, 'Al\ns\n', ''),
+        responses = [subprocess.CompletedProcess([], 0, 'Al\nalt-S\n', ''),
                      subprocess.CompletedProcess([], 0, 'Al\n\n0\trow\n', '')]
         with patch.object(vault.shutil, 'which', return_value='fzf'), \
                 patch.object(vault.subprocess, 'run', side_effect=responses) as run:
@@ -260,7 +260,8 @@ class PickerRegressionTests(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs['input'].startswith('0\t'))
         self.assertIn('Alpha', run.call_args.kwargs['input'].splitlines()[0])
         self.assertIn('--query=Al', run.call_args.args[0])
-        self.assertTrue(any(arg.startswith('--expect=s,') for arg in run.call_args.args[0]))
+        self.assertTrue(any(arg.startswith('--expect=alt-S,') for arg in run.call_args.args[0]))
+        self.assertFalse(any('s' in arg.removeprefix('--expect=').split(',') for arg in run.call_args.args[0] if arg.startswith('--expect=')))
 
     def test_save_and_delete_keep_filtered_position_and_order(self):
         for key, accepted in [('ctrl-s', True), ('ctrl-d', True), ('ctrl-d', False)]:

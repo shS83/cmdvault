@@ -85,7 +85,7 @@ def pulse_background_packet(columns: int, rows: int, *, reserved_rows: int = PUL
     ) + '\x1b[0m\x1b8')
 
 
-def pulse_label_packet(columns: int, rows: int, label: str, *, pixel_width: int | None = None, pixel_height: int | None = None, orb_size: int = 104, margin: int = 64) -> str:
+def pulse_label_packet(columns: int, rows: int, label: str, *, pixel_width: int | None = None, pixel_height: int | None = None, orb_size: int = 104, margin: int = 104) -> str:
     """A subdued label in the reserved area, never over the fzf results."""
     if rows < 14 or columns < 32:
         return ''
@@ -95,7 +95,7 @@ def pulse_label_packet(columns: int, rows: int, label: str, *, pixel_width: int 
     center_x = pw - margin - orb_size / 2
     center_y = ph - margin - orb_size / 2
     column = max(3, min(columns - 12, round((center_x - orb_size / 2 - 12 * cw) / cw) + 1))
-    row = max(rows - PULSE_RESERVED_ROWS + 1, min(rows - 1, round(center_y / ch) + 1))
+    row = max(2, min(rows - 1, round(center_y / ch) + 1))
     return (f'\x1b7\x1b[{row};{column}H' + PULSE_BG +
             pulse_label_color(label) + f'{label:>11}' +
             '\x1b[0m\x1b8')
@@ -120,8 +120,22 @@ HELP_LINES = (
     "CTRL-R      Synchronize approved commands with Cloud Sync",
     "RIGHT       Show full command preview",
     "LEFT        Close command preview",
-    "CTRL-H      Open / close this help",
-    "S           Cycle command sorting",
+    "ALT-SHIFT-H Open / close this help",
+    "ALT-SHIFT-S Cycle command sorting",
+    "CTRL-G      Show global commands",
+    "ALT-SHIFT-F Show global favorites",
+    "CTRL-F      Show favorites",
+    "CTRL-L      Show local commands",
+    "CTRL-P      Toggle priority favorite",
+    "ALT-UP/DOWN Reorder priority favorite",
+    "CTRL-SPACE  Mark / unmark command and move down",
+    "CTRL-O      Toggle command preview",
+    "ALT-LEFT/RIGHT Page command preview",
+    "PGUP/PGDN   Page command list",
+    "UP/DOWN     Move selection",
+    "TAB/SHIFT-TAB Mark and move selection",
+    "CTRL-U      Clear search before cursor",
+    "CTRL-W      Delete previous search word",
     "ESC         Cancel picker (also on error) / close help",
 )
 
@@ -131,7 +145,7 @@ def top_banner_packet(columns: int, rows: int, version: str) -> str:
     if columns < 40 or rows < 14:
         return ''
     left = ""
-    right = "CTRL-H for help"
+    right = "ALT-SHIFT-H for help"
     inner = max(0, columns - 8)
     left = left[:max(0, inner - len(right) - 2)]
     gap = max(2, inner - len(left) - len(right))
@@ -140,12 +154,13 @@ def top_banner_packet(columns: int, rows: int, version: str) -> str:
             + f'\x1b[1;5H{header}' + '\x1b[0m\x1b8')
 
 
-def help_modal_packet(columns: int, rows: int, enter_action: str = 'run') -> str:
+def help_modal_packet(columns: int, rows: int, enter_action: str = 'run', scroll: int = 0) -> str:
     """Centered, opaque text dialog: no network calls or history access."""
     if columns < 50 or rows < 18:
         return ''
     width = min(66, columns - 8)
-    height = len(HELP_LINES) + 6
+    visible_lines = HELP_LINES[scroll:scroll + max(1, rows - 10)]
+    height = len(visible_lines) + 6
     top = max(1, (rows - height) // 2 + 1)
     left = max(1, (columns - width) // 2 + 1)
     bg = '\x1b[48;2;17;13;27m'
@@ -166,13 +181,13 @@ def help_modal_packet(columns: int, rows: int, enter_action: str = 'run') -> str
         framed("CMDVAULT  ·  KEYBOARD HELP"),
         "├" + "─" * (width - 2) + "┤",
     ]
-    for value in HELP_LINES:
+    for value in visible_lines:
         if value.startswith('ENTER'):
             value = value.replace('Run or select', enter_action.capitalize() + ' or select', 1)
         content.append(framed(value))
     content.extend([
         framed(),
-        framed("ESC / ENTER / CTRL-H  ·  CLOSE"),
+        framed("ESC / ENTER  CLOSE · UP/DOWN SCROLL"),
         "╰" + "─" * (width - 2) + "╯",
     ])
     return ('\x1b7' + ''.join(line(top + i, value,
@@ -300,6 +315,7 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
     sixel_frame_geometry = None
     pulse_needs_draw = True
     help_visible = False
+    help_scroll = 0
     error_text = env.get("CMDVAULT_ERROR_MODAL", "")[:16384]
     error_visible = bool(error_text)
     error_scroll = 0
@@ -432,7 +448,10 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                             error_drawn = False
                     elif help_visible:
                         # A dismissal key refreshes fzf; do not feed it to search.
-                        if keys:
+                        if keys in (b'\x1b[A', b'\x1b[B'):
+                            help_scroll = max(0, min(max(0, len(HELP_LINES) - max(1, rows - 10)), help_scroll + (1 if keys == b'\x1b[B' else -1)))
+                            emit(help_modal_packet(columns, rows, enter_action, help_scroll))
+                        elif keys:
                             help_visible = False
                             emit('\x1b[2J\x1b[H')
                             sixel_frame_geometry = None
@@ -447,12 +466,13 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                             pulse_needs_draw = True
                             ready_to_place = True
                             last_output = time.monotonic()
-                    elif b'\x08' in keys:
-                        prefix, _, _suffix = keys.partition(b'\x08')
+                    elif b'\x1bH' in keys:
+                        prefix, _, _suffix = keys.partition(b'\x1bH')
                         if prefix:
                             write_all(master, prefix)
                         help_visible = True
-                        emit(help_modal_packet(columns, rows, enter_action))
+                        help_scroll = 0
+                        emit(help_modal_packet(columns, rows, enter_action, help_scroll))
                     else:
                         write_all(master,keys)
                 if master in readable:

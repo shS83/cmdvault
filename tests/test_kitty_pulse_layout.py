@@ -14,6 +14,6 @@ class KittyPulseLayoutTest(unittest.TestCase):
 
     def test_pixel_offset_and_no_fixed_5x3_stretch(self):
         source = (ROOT / "src/visuals/kitty.py").read_text()
-        self.assertIn("margin = 32", source)
+        self.assertIn("margin = 104", source)
         self.assertIn("X={ox},Y={oy}", source)
         self.assertNotIn("p=1,c=5,r=3", source)

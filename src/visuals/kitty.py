@@ -204,7 +204,7 @@ class KittyPulseOverlay:
         pw = pixel_width or columns * 8
         ph = pixel_height or rows * 16
         cw, ch = pw / columns, ph / rows
-        margin = 64  # user-adjusted inset from window edges, in physical pixels
+        margin = 104  # user-adjusted inset from window edges, in physical pixels
         orb_px = self.pulse.style.size
         left_px = max(0, pw - margin - orb_px)
         top_px = max(0, ph - margin - orb_px)
@@ -292,13 +292,9 @@ class KittyRenderer(AnsiRenderer):
             row = ('  '+text[:max(0,self.width-4)]).ljust(self.width)
             rows.append(f"\x1b[{y+1};1H"+color+row)
         if pulse_visible:
-            # Center the text underneath the 5-column orb, without touching
-            # either the lower or right Neon Frame.
-            label = self.sync_pulse.label
-            label_col = max(3, self.width - 23)
-            label_row = self.height - 4
-            rows.append(f"\x1b[{label_row};{label_col}H" + color +
-                        f"\x1b[38;2;199;180;216m{label:>11}\x1b[0m")
+            from .picker import pulse_label_packet
+            rows.append(pulse_label_packet(self.width, self.height, self.sync_pulse.label,
+                        pixel_width=pixel_width, pixel_height=pixel_height))
         self.emit(''.join(rows)+"\x1b[0m")
         self.emit(self.decoration.place(self.width,self.height))
         self._pulse_pixel_geometry = (pixel_width, pixel_height)
