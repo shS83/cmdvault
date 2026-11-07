@@ -12,7 +12,6 @@ from .effects import neon_asset, LOOP_SECONDS
 from .sync_pulse import SyncPulse, PulseStyle, SyncState, intensity
 
 SESSION_SEED = secrets.randbits(32)
-PULSE_SHIFT_PX = 15
 
 
 def command(control: str, payload: str = '') -> str:
@@ -200,10 +199,12 @@ class KittyPulseOverlay:
         level = round(intensity(self.pulse.state, max(0, now - self.pulse._since)) * 20)
         key = (self.pulse.state, level, round(self.config.glow * 100))
         # Kitty placement X/Y are pixel offsets inside a terminal cell.
+        # Keep 12px between the orb and the INNER edge of the neon border.
+        # The outer 20px are occupied by the frame itself.
         pw = pixel_width or columns * 8
         ph = pixel_height or rows * 16
         cw, ch = pw / columns, ph / rows
-        margin = 64 + PULSE_SHIFT_PX
+        margin = 104  # user-adjusted inset from window edges, in physical pixels
         orb_px = self.pulse.style.size
         left_px = max(0, pw - margin - orb_px)
         top_px = max(0, ph - margin - orb_px)
@@ -291,14 +292,9 @@ class KittyRenderer(AnsiRenderer):
             row = ('  '+text[:max(0,self.width-4)]).ljust(self.width)
             rows.append(f"\x1b[{y+1};1H"+color+row)
         if pulse_visible:
-            # Center the text underneath the 5-column orb, without touching
-            # either the lower or right Neon Frame.
-            label = self.sync_pulse.label
-            # ANSI text can move only by whole terminal cells.
-            label_col = max(3, self.width - 23 - round(PULSE_SHIFT_PX * self.width / pixel_width))
-            label_row = max(1, self.height - 5 - round(PULSE_SHIFT_PX * self.height / pixel_height))
-            rows.append(f"\x1b[{label_row};{label_col}H" + color +
-                        f"\x1b[38;2;199;180;216m{label:>11}\x1b[0m")
+            from .picker import pulse_label_packet
+            rows.append(pulse_label_packet(self.width, self.height, self.sync_pulse.label,
+                        pixel_width=pixel_width, pixel_height=pixel_height))
         self.emit(''.join(rows)+"\x1b[0m")
         self.emit(self.decoration.place(self.width,self.height))
         self._pulse_pixel_geometry = (pixel_width, pixel_height)

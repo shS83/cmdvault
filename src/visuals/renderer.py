@@ -29,7 +29,8 @@ class Renderer(ABC):
 
     def cleanup(self) -> None:
         if self.active:
-            self.emit("\x1b[0m\x1b[?25h\x1b[?1049l\x1b8")
+            from .terminal import RESET_TERMINAL
+            self.emit(RESET_TERMINAL + "\x1b8")
             self.active = False
 
     def __enter__(self):

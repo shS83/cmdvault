@@ -28,6 +28,9 @@ def select(requested: str, caps: Capabilities, *, raster_layout: bool = False):
     backend = "kitty" if available and caps.kitty else "sixel" if available and caps.sixel else "ansi"
     if requested == "ansi":
         return "ansi", ""
+    # An explicit choice also works when TERM does not advertise SIXEL (WSL).
+    if requested == "sixel" and available:
+        return "sixel", ""
     if requested == "auto":
         return backend, ""
     if available and getattr(caps, requested, False):

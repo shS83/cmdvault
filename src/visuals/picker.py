@@ -24,7 +24,7 @@ from .kitty import KittyDecoration, AnimationLoader, KittyPulseOverlay
 import secrets
 
 
-PULSE_RESERVED_ROWS = 5
+PULSE_RESERVED_ROWS = 4
 PULSE_BG = "\x1b[48;2;11;8;18m"
 
 # Label colors are intentionally independent of the metallic orb surface.
@@ -44,7 +44,7 @@ def pulse_label_color(label: str) -> str:
 
 
 
-def with_pulse_margin(argv: Sequence[str], rows: int, columns: int) -> list[str]:
+def with_pulse_margin(argv: Sequence[str], rows: int, columns: int, bottom: int = PULSE_RESERVED_ROWS) -> list[str]:
     """Reserve the bottom rows in fzf itself, preserving keyboard navigation.
 
     fzf must know the reduced result height: hiding its output afterwards loses
@@ -67,25 +67,25 @@ def with_pulse_margin(argv: Sequence[str], rows: int, columns: int) -> list[str]
             parts *= 4
         elif len(parts) == 2:
             parts = [parts[0], parts[1], parts[0], parts[1]]
-        parts[2] = str(max(PULSE_RESERVED_ROWS, int(parts[2]) if parts[2].isdigit() else 0))
+        parts[2] = str(max(bottom, int(parts[2]) if parts[2].isdigit() else 0))
         arguments[value_index] = ','.join(parts) if option == '--margin' else '--margin=' + ','.join(parts)
         return arguments
-    arguments.append(f'--margin=0,0,{PULSE_RESERVED_ROWS},0')
+    arguments.append(f'--margin=0,0,{bottom},0')
     return arguments
 
 
-def pulse_background_packet(columns: int, rows: int) -> str:
+def pulse_background_packet(columns: int, rows: int, *, reserved_rows: int = PULSE_RESERVED_ROWS, frame_rows: int = 1) -> str:
     """Fill only the interior of fzf's reserved rows, leaving frame margins clear."""
     if rows < 14 or columns < 32:
         return ''
-    start_row = max(1, rows - PULSE_RESERVED_ROWS + 1)
+    start_row = max(1, rows - reserved_rows + 1)
     interior = ' ' * max(0, columns - 4)
     return ('\x1b7' + PULSE_BG + ''.join(
-        f'\x1b[{row};3H{interior}' for row in range(start_row, rows)
+        f'\x1b[{row};3H{interior}' for row in range(start_row, rows - frame_rows + 1)
     ) + '\x1b[0m\x1b8')
 
 
-def pulse_label_packet(columns: int, rows: int, label: str, *, pixel_width: int | None = None, pixel_height: int | None = None, orb_size: int = 104, margin: int = 64) -> str:
+def pulse_label_packet(columns: int, rows: int, label: str, *, pixel_width: int | None = None, pixel_height: int | None = None, orb_size: int = 104, margin: int = 104) -> str:
     """A subdued label in the reserved area, never over the fzf results."""
     if rows < 14 or columns < 32:
         return ''
@@ -95,10 +95,20 @@ def pulse_label_packet(columns: int, rows: int, label: str, *, pixel_width: int 
     center_x = pw - margin - orb_size / 2
     center_y = ph - margin - orb_size / 2
     column = max(3, min(columns - 12, round((center_x - orb_size / 2 - 12 * cw) / cw) + 1))
-    row = max(rows - PULSE_RESERVED_ROWS + 1, min(rows - 1, round(center_y / ch)))
+    row = max(2, min(rows - 1, round(center_y / ch) + 1))
     return (f'\x1b7\x1b[{row};{column}H' + PULSE_BG +
             pulse_label_color(label) + f'{label:>11}' +
             '\x1b[0m\x1b8')
+
+
+def ansi_status_packet(columns: int, rows: int, label: str, *, footer_inset: int = 1) -> str:
+    """Right-align sync state in the reserved footer without moving the cursor."""
+    if rows < 14 or columns < 32:
+        return ''
+    text = "STATUS: " + label.upper()
+    return (f'\x1b7\x1b[{rows - footer_inset};3H' + PULSE_BG + ' ' * (columns - 4)
+            + f'\x1b[{rows - footer_inset};{columns - len(text) - 2}H'
+            + pulse_label_color(label) + text + '\x1b[0m\x1b8')
 
 
 HELP_LINES = (
@@ -107,11 +117,25 @@ HELP_LINES = (
     "ALT-F       Save favorite (alternative shortcut)",
     "CTRL-D      Permanently delete selected command",
     "CTRL-Y      Copy selected command",
-    "CTRL-R      Check Cloud Sync service status",
+    "CTRL-R      Synchronize approved commands with Cloud Sync",
     "RIGHT       Show full command preview",
     "LEFT        Close command preview",
-    "CTRL-H      Open / close this help",
-    "S           Cycle command sorting",
+    "ALT-SHIFT-H Open / close this help",
+    "ALT-SHIFT-S Cycle command sorting",
+    "CTRL-G      Show global commands",
+    "ALT-SHIFT-F Show global favorites",
+    "CTRL-F      Show favorites",
+    "CTRL-L      Show local commands",
+    "CTRL-P      Toggle priority favorite",
+    "ALT-UP/DOWN Reorder priority favorite",
+    "CTRL-SPACE  Mark / unmark command and move down",
+    "CTRL-O      Toggle command preview",
+    "ALT-LEFT/RIGHT Page command preview",
+    "PGUP/PGDN   Page command list",
+    "UP/DOWN     Move selection",
+    "TAB/SHIFT-TAB Mark and move selection",
+    "CTRL-U      Clear search before cursor",
+    "CTRL-W      Delete previous search word",
     "ESC         Cancel picker (also on error) / close help",
 )
 
@@ -121,7 +145,7 @@ def top_banner_packet(columns: int, rows: int, version: str) -> str:
     if columns < 40 or rows < 14:
         return ''
     left = ""
-    right = "CTRL-H for help"
+    right = "ALT-SHIFT-H for help"
     inner = max(0, columns - 8)
     left = left[:max(0, inner - len(right) - 2)]
     gap = max(2, inner - len(left) - len(right))
@@ -130,12 +154,13 @@ def top_banner_packet(columns: int, rows: int, version: str) -> str:
             + f'\x1b[1;5H{header}' + '\x1b[0m\x1b8')
 
 
-def help_modal_packet(columns: int, rows: int, enter_action: str = 'run') -> str:
+def help_modal_packet(columns: int, rows: int, enter_action: str = 'run', scroll: int = 0) -> str:
     """Centered, opaque text dialog: no network calls or history access."""
     if columns < 50 or rows < 18:
         return ''
     width = min(66, columns - 8)
-    height = len(HELP_LINES) + 6
+    visible_lines = HELP_LINES[scroll:scroll + max(1, rows - 10)]
+    height = len(visible_lines) + 6
     top = max(1, (rows - height) // 2 + 1)
     left = max(1, (columns - width) // 2 + 1)
     bg = '\x1b[48;2;17;13;27m'
@@ -156,13 +181,13 @@ def help_modal_packet(columns: int, rows: int, enter_action: str = 'run') -> str
         framed("CMDVAULT  ·  KEYBOARD HELP"),
         "├" + "─" * (width - 2) + "┤",
     ]
-    for value in HELP_LINES:
+    for value in visible_lines:
         if value.startswith('ENTER'):
             value = value.replace('Run or select', enter_action.capitalize() + ' or select', 1)
         content.append(framed(value))
     content.extend([
         framed(),
-        framed("ESC / ENTER / CTRL-H  ·  CLOSE"),
+        framed("ESC / ENTER  CLOSE · UP/DOWN SCROLL"),
         "╰" + "─" * (width - 2) + "╯",
     ])
     return ('\x1b7' + ''.join(line(top + i, value,
@@ -262,8 +287,10 @@ def write_all(fd: int, data: bytes) -> None:
 
 
 def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
-               config: VisualConfig) -> subprocess.CompletedProcess:
+               config: VisualConfig, graphics: bool = True, sixel: bool = False) -> subprocess.CompletedProcess:
     """subprocess.run-compatible selection result with a coordinated terminal."""
+    from .geometry import PixelReports, PIXEL_QUERY
+    pixel_reports = PixelReports()
     terminal = os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)
     master, slave = os.openpty()
     original = termios.tcgetattr(terminal)
@@ -285,8 +312,10 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
     loader = None
     animation_geometry = None
     pulse_geometry = None
+    sixel_frame_geometry = None
     pulse_needs_draw = True
     help_visible = False
+    help_scroll = 0
     error_text = env.get("CMDVAULT_ERROR_MODAL", "")[:16384]
     error_visible = bool(error_text)
     error_scroll = 0
@@ -312,7 +341,15 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
         raw = fcntl.ioctl(terminal,termios.TIOCGWINSZ,b'\0'*8)
         rows, columns, xp, yp = struct.unpack('HHHH',raw)
         fcntl.ioctl(master,termios.TIOCSWINSZ,raw)
+        if sixel:
+            xp, yp = pixel_reports.pixels(max(1, columns), max(1, rows), xp, yp)
         return max(1,columns),max(1,rows),xp,yp
+
+    def decoration_upload(*args, **kwargs):
+        return decoration.upload(*args, **kwargs) if graphics else ''
+
+    def clear_pulse():
+        return pulse.clear() if graphics else ''
 
     def emit(value):
         write_all(terminal,value.encode('utf-8'))
@@ -320,20 +357,23 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
     try:
         columns, rows, xp, yp = geometry()
         # Precompute before raw mode; frame generation must not delay keystrokes.
-        upload = decoration.upload(xp or columns*8,yp or rows*16,columns,rows,animate=False)
+        upload = decoration_upload(xp or columns*8,yp or rows*16,columns,rows,animate=False)
         with tempfile.TemporaryFile() as source, tempfile.TemporaryFile() as result:
             source.write(input.encode('utf-8'))
             source.seek(0)
             tty.setraw(terminal)
-            emit('\x1b[?1049h\x1b[2J\x1b[H')
+            emit('\x1b[?1049h\x1b[48;2;11;8;18m\x1b[2J\x1b[H')
             screen_entered = True
-            picker_args = with_pulse_margin(argv, rows, columns)
+            if sixel:
+                emit(PIXEL_QUERY)
+            from .sixel import footer_rows
+            picker_args = with_pulse_margin(argv, rows, columns, footer_rows(rows) if sixel else PULSE_RESERVED_ROWS)
             process = subprocess.Popen(picker_args,stdin=source,stdout=result,stderr=slave,
                                        env=env,preexec_fn=child_terminal,close_fds=True)
             os.close(slave)
             slave = -1
             previous_signal = signal.signal(signal.SIGWINCH,resize_signal)
-            for signum in (signal.SIGTERM,signal.SIGHUP):
+            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
                 exit_signals[signum] = signal.signal(signum,exit_signal)
             ready_to_place = False
             last_output = time.monotonic()
@@ -348,7 +388,7 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                             if state in PULSE_LABEL_COLORS:
                                 pulse.set_state(state)
                                 pulse_needs_draw = True
-                            if state == "error":
+                            if state in ("error", "offline"):
                                 error_text = str(status.get("message") or "Cloud Sync failed without an error message")[:16384]
                                 error_scroll = 0
                                 error_visible = True
@@ -360,17 +400,31 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                     if process.poll() is None:
                         os.killpg(process.pid,signal.SIGWINCH)
                     resized = False
-                    upload = decoration.upload(xp or columns*8,yp or rows*16,columns,rows,animate=False) or upload
+                    if sixel:
+                        emit(PIXEL_QUERY)
+                    upload = decoration_upload(xp or columns*8,yp or rows*16,columns,rows,animate=False) or upload
                     ready_to_place = True
                     pulse_needs_draw = True
                     heading_dirty = True
                     error_drawn = False
                 readable,_,_ = select.select([terminal,master],[],[],
                     .02 if loader and not loader.done.is_set() else .05 if ready_to_place else .25)
-                if terminal in readable:
-                    keys = os.read(terminal,65536)
+                if terminal in readable or (sixel and pixel_reports.expired()):
+                    if terminal in readable:
+                        keys = os.read(terminal,65536)
+                        if not keys:
+                            break
+                        if sixel:
+                            previous_pixels = pixel_reports.pixels(columns, rows, xp, yp)
+                            keys = pixel_reports.feed(keys)
+                            current_pixels = pixel_reports.pixels(columns, rows, xp, yp)
+                            if current_pixels != previous_pixels:
+                                xp, yp = current_pixels
+                                ready_to_place = pulse_needs_draw = heading_dirty = True
+                    else:
+                        keys = pixel_reports.flush()
                     if not keys:
-                        break
+                        continue
                     if error_visible:
                         if keys == b"\x1b":
                             error_visible = False
@@ -378,10 +432,11 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                         elif keys in (b"\r", b"\n", b"\x08"):
                             error_visible = False
                             emit('\x1b[2J\x1b[H')
+                            sixel_frame_geometry = None
                             decoration.key = None
-                            upload = decoration.upload(xp or columns*8, yp or rows*16,
+                            upload = decoration_upload(xp or columns*8, yp or rows*16,
                                                        columns, rows, animate=False)
-                            pulse.clear()
+                            clear_pulse()
                             write_all(master, b"\x0c")
                             heading_dirty = pulse_needs_draw = ready_to_place = True
                             last_output = time.monotonic()
@@ -393,26 +448,31 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                             error_drawn = False
                     elif help_visible:
                         # A dismissal key refreshes fzf; do not feed it to search.
-                        if keys:
+                        if keys in (b'\x1b[A', b'\x1b[B'):
+                            help_scroll = max(0, min(max(0, len(HELP_LINES) - max(1, rows - 10)), help_scroll + (1 if keys == b'\x1b[B' else -1)))
+                            emit(help_modal_packet(columns, rows, enter_action, help_scroll))
+                        elif keys:
                             help_visible = False
                             emit('\x1b[2J\x1b[H')
+                            sixel_frame_geometry = None
                             # Erasing the text screen can also discard Kitty
                             # placements, so restore both graphics afterwards.
                             decoration.key = None
-                            upload = decoration.upload(xp or columns*8, yp or rows*16,
+                            upload = decoration_upload(xp or columns*8, yp or rows*16,
                                                        columns, rows, animate=False)
-                            pulse.clear()
+                            clear_pulse()
                             write_all(master, b'\x0c')  # fzf redraw-screen
                             heading_dirty = True
                             pulse_needs_draw = True
                             ready_to_place = True
                             last_output = time.monotonic()
-                    elif b'\x08' in keys:
-                        prefix, _, _suffix = keys.partition(b'\x08')
+                    elif b'\x1bH' in keys:
+                        prefix, _, _suffix = keys.partition(b'\x1bH')
                         if prefix:
                             write_all(master, prefix)
                         help_visible = True
-                        emit(help_modal_packet(columns, rows, enter_action))
+                        help_scroll = 0
+                        emit(help_modal_packet(columns, rows, enter_action, help_scroll))
                     else:
                         write_all(master,keys)
                 if master in readable:
@@ -431,9 +491,10 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                     # Re-place after erasure / alternate screen changes. Upload
                     # again only after destructive operations, not every key.
                     if boundary.erasures != previous_erasures:
+                        sixel_frame_geometry = None
                         decoration.key = None
-                        upload = decoration.upload(xp or columns*8,yp or rows*16,columns,rows,animate=False) or upload
-                        pulse.clear()
+                        upload = decoration_upload(xp or columns*8,yp or rows*16,columns,rows,animate=False) or upload
+                        clear_pulse()
                         pulse_needs_draw = True
                     ready_to_place = True
                     last_output = time.monotonic()
@@ -443,10 +504,14 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                         if loader:
                             loader.close()
                             loader = None
-                        if config.animation:
+                        if graphics and config.animation:
                             loader = AnimationLoader(decoration,xp or columns*8,yp or rows*16,columns,rows)
                         animation_geometry = geometry_key
-                    emit(upload + decoration.place(columns,rows))
+                    emit(upload + (decoration.place(columns,rows) if graphics else ''))
+                    if sixel and not error_visible and sixel_frame_geometry != geometry_key:
+                        from .sixel import sixel_frame_packet
+                        emit(sixel_frame_packet(columns, rows, xp, yp, config.glow))
+                        sixel_frame_geometry = geometry_key
                     # The parent is the only terminal writer. Place the overlay
                     # only after fzf's complete escape sequence and redraw.
                     pulse_needs_draw = True
@@ -457,7 +522,8 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                     emit(loader.drain())
                 if not help_visible and boundary.safe and not ready_to_place and not upload:
                     if heading_dirty:
-                        emit(top_banner_packet(columns, rows, heading_version))
+                        if not sixel:
+                            emit(top_banner_packet(columns, rows, heading_version))
                         heading_dirty = False
                     location = (columns, rows, xp, yp)
                     if location != pulse_geometry:
@@ -468,10 +534,23 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                         force=pulse_needs_draw,
                         pixel_width=xp or columns * 8,
                         pixel_height=yp or rows * 16,
-                    )
+                    ) if graphics else ''
                     if pulse_needs_draw:
-                        emit(pulse_background_packet(columns, rows))
-                        emit(pulse_label_packet(columns, rows, pulse.label, pixel_width=xp or columns * 8, pixel_height=yp or rows * 16, orb_size=pulse.pulse.style.size))
+                        if sixel:
+                            # The SIXEL bottom tube occupies the penultimate row;
+                            # text erasure there deletes the image in Windows Terminal.
+                            emit(pulse_background_packet(columns, rows,
+                                reserved_rows=footer_rows(rows), frame_rows=2))
+                        else:
+                            emit(pulse_background_packet(columns, rows))
+                        if graphics:
+                            emit(pulse_label_packet(columns, rows, pulse.label, pixel_width=xp or columns * 8, pixel_height=yp or rows * 16, orb_size=pulse.pulse.style.size))
+                        else:
+                            if not sixel or error_visible:
+                                emit(ansi_status_packet(columns, rows, pulse.label, footer_inset=2 if sixel else 1))
+                            if sixel and not error_visible:
+                                from .sixel import sixel_status_packet
+                                emit(sixel_status_packet(columns, rows, pulse.label, xp, yp))
                     if packet:
                         emit(packet)
                     pulse_needs_draw = False
@@ -484,25 +563,38 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
             result.seek(0)
             return subprocess.CompletedProcess(argv,code,result.read().decode('utf-8'),'')
     finally:
-        if loader:
-            loader.close()
-        for signum,handler in exit_signals.items():
-            signal.signal(signum,handler)
-        if previous_signal is not None:
-            signal.signal(signal.SIGWINCH,previous_signal)
-        if process is not None and process.poll() is None:
-            os.killpg(process.pid,signal.SIGTERM)
-            try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid,signal.SIGKILL)
-                process.wait()
+        from .terminal import restore_terminal
+        # A second interrupt must not abort recovery while the tty is raw.
+        for signum in exit_signals:
+            signal.signal(signum, signal.SIG_IGN)
         try:
-            if screen_entered:
-                emit(pulse.clear()+decoration.delete()+'\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?2004l\x1b[?7h\x1b[0m\x1b[?25h\x1b[?1049l')
+            try:
+                cleanup = clear_pulse() + (decoration.delete() if graphics else '')
+                restore_terminal(terminal, original, cleanup if screen_entered else '')
+            finally:
+                # These operations can raise or wait; the keyboard is already restored.
+                try:
+                    if process is not None and process.poll() is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.wait(timeout=1)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            process.wait(timeout=1)
+                finally:
+                    if loader:
+                        loader.close()
         finally:
-            termios.tcsetattr(terminal,termios.TCSANOW,original)
-            os.close(terminal)
-            os.close(master)
-            if slave >= 0:
-                os.close(slave)
+            for signum, handler in exit_signals.items():
+                signal.signal(signum, handler)
+            if previous_signal is not None:
+                signal.signal(signal.SIGWINCH, previous_signal)
+            for descriptor in (terminal, master, slave):
+                if descriptor >= 0:
+                    os.close(descriptor)

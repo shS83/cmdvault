@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,5 +90,57 @@ class TwoWayTests(unittest.TestCase):
                 self.assertEqual(sync.push(), 1)
                 self.assertEqual(len(api.entries), 1)
                 self.assertIn('ciphertext', staged)
+
+    def test_pull_before_retry_recovers_lost_receipt_after_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            api, key = FakeAPI(), os.urandom(32)
+            path = Path(td) / 'a.db'
+            with LocalStore(path) as store:
+                record = store.put_command('echo recovered')
+                store.set_sync_state(record.uuid, SyncState.ELIGIBLE, scanner=CommandSecretScanner())
+                class LostResponse:
+                    def push(self, changes):
+                        api.push(changes)
+                        raise OSError('response lost after server commit')
+                with self.assertRaises(OSError):
+                    TwoWaySync(store, LostResponse(), key).push()
+                staged = store.connection.execute('SELECT request_json FROM cv_sync_requests').fetchone()[0]
+            with LocalStore(path) as store:
+                sync = TwoWaySync(store, api, key)
+                # This is the order used by Ctrl-R, unlike the old retry test.
+                self.assertEqual(sync.pull(), 1)
+                self.assertEqual(sync.push(), 1)
+                self.assertEqual(len(api.entries), 1)
+                self.assertEqual(api.entries[0]['envelope'], json.loads(staged)['envelope'])
+                self.assertEqual(store.outbox.pending(), [])
+                self.assertEqual(store.connection.execute('SELECT count(*) FROM cv_sync_requests').fetchone()[0], 0)
+
+    def test_real_competing_edit_does_not_overwrite_remote_or_discard_outbox(self):
+        import json
+        from src.security.crypto import seal_record
+        with tempfile.TemporaryDirectory() as td:
+            api, key = FakeAPI(), os.urandom(32)
+            with LocalStore(Path(td) / 'a.db') as store:
+                record = store.put_command('echo local edit')
+                store.set_sync_state(record.uuid, SyncState.ELIGIBLE, scanner=CommandSecretScanner())
+                class NotSent:
+                    def push(self, changes):
+                        raise OSError('request never reached server')
+                with self.assertRaises(OSError):
+                    TwoWaySync(store, NotSent(), key).push()
+                change_id = str(uuid4())
+                remote = {'change_id': change_id, 'record_uuid': record.uuid,
+                          'base_revision': 0, 'operation': 'upsert',
+                          'envelope': seal_record(key, json.dumps({'kind': 'command',
+                                       'data': {'command': 'echo competing edit'}}).encode(),
+                                       record.uuid, change_id, 0)}
+                api.push([remote])
+                sync = TwoWaySync(store, api, key)
+                sync.pull()
+                with self.assertRaisesRegex(ValueError, 'revision conflict'):
+                    sync.push()
+                self.assertEqual(len(api.entries), 1)
+                self.assertEqual(len(store.outbox.pending()), 1)
+                self.assertEqual(store.connection.execute('SELECT count(*) FROM cv_sync_requests').fetchone()[0], 1)
 
 if __name__ == '__main__': unittest.main()

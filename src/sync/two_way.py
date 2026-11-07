@@ -106,8 +106,10 @@ class TwoWaySync:
             base_revision = self.revision(record.uuid)
             if existing:
                 mutation = json.loads(existing[0])
-                if mutation['base_revision'] != base_revision:
-                    raise SyncConflict('remote_revision_changed')
+                # Pull may already have observed this accepted upload after its
+                # response was lost. Retry the exact staged request so the server
+                # can return its idempotent receipt. Never rebase or re-encrypt it:
+                # an actual competing edit must still fail server revision checks.
             else:
                 if event.operation == 'delete' and base_revision == 0:
                     # No remote record was ever created: no tombstone needed.
