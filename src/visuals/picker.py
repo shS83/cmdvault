@@ -24,7 +24,7 @@ from .kitty import KittyDecoration, AnimationLoader, KittyPulseOverlay
 import secrets
 
 
-PULSE_RESERVED_ROWS = 4
+PULSE_RESERVED_ROWS = 5
 PULSE_BG = "\x1b[48;2;11;8;18m"
 
 # Label colors are intentionally independent of the metallic orb surface.
@@ -95,7 +95,7 @@ def pulse_label_packet(columns: int, rows: int, label: str, *, pixel_width: int 
     center_x = pw - margin - orb_size / 2
     center_y = ph - margin - orb_size / 2
     column = max(3, min(columns - 12, round((center_x - orb_size / 2 - 12 * cw) / cw) + 1))
-    row = max(rows - PULSE_RESERVED_ROWS + 1, min(rows - 1, round(center_y / ch) + 1))
+    row = max(rows - PULSE_RESERVED_ROWS + 1, min(rows - 1, round(center_y / ch)))
     return (f'\x1b7\x1b[{row};{column}H' + PULSE_BG +
             pulse_label_color(label) + f'{label:>11}' +
             '\x1b[0m\x1b8')
