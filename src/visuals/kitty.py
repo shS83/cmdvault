@@ -66,6 +66,69 @@ def frame_gap(frame: int, fps: int) -> int:
     return round((frame+1)*1000/fps)-round(frame*1000/fps)
 
 
+
+
+class KittyLogoOverlay:
+    """Static, alpha-preserving logo in fzf's reserved top margin."""
+
+    def __init__(self, path, image_id):
+        from pathlib import Path
+        self.path = Path(path)
+        self.image_id = image_id
+        self.key = None
+        self.placed_at = None
+
+    def invalidate(self):
+        # Terminal erasures or geometry changes may discard the image.
+        self.key = None
+        self.placed_at = None
+
+    def clear(self):
+        self.invalidate()
+        return command(f'a=d,d=I,i={self.image_id},q=2')
+
+    def packet(self, columns, rows, *, pixel_width=None, pixel_height=None):
+        if not self.path.is_file() or columns < 56 or rows < 24:
+            return ''
+        from PIL import Image
+
+        pw, ph = pixel_width or columns * 8, pixel_height or rows * 16
+        cw, ch = pw / columns, ph / rows
+        # Six top rows are reserved by cmdvault's fzf margin. Keep the
+        # outermost cell free for the existing animated neon tube.
+        # Use the original high-resolution PNG. Keep its aspect ratio and
+        # leave space above/below the logo for the animated neon border/fzf.
+        max_height = max(1, int(min(188, 4.6 * ch)))
+        max_width = max(1, int(min(1000, pw - 8 * cw)))
+        with Image.open(self.path) as source:
+            logo = source.convert('RGBA')
+            logo.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+        if logo.width <= 0 or logo.height <= 0:
+            return ''
+
+        key = (pw, ph, columns, rows, logo.size)
+        result = ''
+        if key != self.key:
+            result += self.clear()
+            result += encode_rgba(logo.tobytes(), logo.width, logo.height,
+                                  self.image_id, compressed=True)
+            self.key = key
+
+        # Center within the reserved header, below the top neon tube.
+        left = max(0, (pw - logo.width) // 2)
+        top = max(round(1.25 * ch), round(ch + (4.4 * ch - logo.height) / 2))
+        col = max(1, int(left // cw) + 1)
+        row = max(1, int(top // ch) + 1)
+        ox = max(0, int(left - (col - 1) * cw))
+        oy = max(0, int(top - (row - 1) * ch))
+        placement = (col, row, ox, oy)
+        if placement != self.placed_at:
+            result += ('\x1b7' + f'\x1b[{row};{col}H' + command(
+                f'a=p,i={self.image_id},p=1,X={ox},Y={oy},z=3,C=1,q=2') + '\x1b8')
+            self.placed_at = placement
+        return result
+
+
 class KittyDecoration:
     """Cached assets, application-owned IDs and terminal-driven playback."""
     def __init__(self, config: VisualConfig):
@@ -207,7 +270,7 @@ class KittyPulseOverlay:
         margin = 104  # user-adjusted inset from window edges, in physical pixels
         orb_px = self.pulse.style.size
         left_px = max(0, pw - margin - orb_px)
-        top_px = max(0, ph - margin - orb_px)
+        top_px = max(0, ph - margin - orb_px + 10)
         col = max(1, int(left_px // cw) + 1)
         row = max(1, int(top_px // ch) + 1)
         off_x = round(left_px - (col - 1) * cw)

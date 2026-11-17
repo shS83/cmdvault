@@ -20,7 +20,7 @@ import re
 import tty
 from typing import Mapping, Sequence
 from .config import VisualConfig
-from .kitty import KittyDecoration, AnimationLoader, KittyPulseOverlay
+from .kitty import KittyDecoration, AnimationLoader, KittyPulseOverlay, KittyLogoOverlay
 import secrets
 
 
@@ -151,7 +151,7 @@ def top_banner_packet(columns: int, rows: int, version: str) -> str:
     gap = max(2, inner - len(left) - len(right))
     header = (left + ' ' * gap + right)[:inner]
     return ('\x1b7\x1b[48;2;11;8;18m\x1b[38;2;195;150;245m'
-            + f'\x1b[1;5H{header}' + '\x1b[0m\x1b8')
+            + f'\x1b[3;5H{header}' + '\x1b[0m\x1b8')
 
 
 def help_modal_packet(columns: int, rows: int, enter_action: str = 'run', scroll: int = 0) -> str:
@@ -299,6 +299,10 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
     while pulse_id == decoration.image_id:
         pulse_id = secrets.randbelow(2**31 - 1) + 1
     pulse = KittyPulseOverlay(config, pulse_id)
+    logo_id = secrets.randbelow(2**31 - 1) + 1
+    while logo_id in (pulse_id, decoration.image_id):
+        logo_id = secrets.randbelow(2**31 - 1) + 1
+    logo = KittyLogoOverlay(Path(__file__).resolve().parents[2] / "cmdvault.png", logo_id)
     # Explicit, local-only visual preview; no sync API calls or history access.
     demo_state = os.environ.get("CMDVAULT_PULSE_DEMO", "").strip().lower()
     if demo_state in PULSE_LABEL_COLORS:
@@ -406,6 +410,7 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                     ready_to_place = True
                     pulse_needs_draw = True
                     heading_dirty = True
+                    logo.invalidate()
                     error_drawn = False
                 readable,_,_ = select.select([terminal,master],[],[],
                     .02 if loader and not loader.done.is_set() else .05 if ready_to_place else .25)
@@ -437,6 +442,7 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                             upload = decoration_upload(xp or columns*8, yp or rows*16,
                                                        columns, rows, animate=False)
                             clear_pulse()
+                            logo.invalidate()
                             write_all(master, b"\x0c")
                             heading_dirty = pulse_needs_draw = ready_to_place = True
                             last_output = time.monotonic()
@@ -461,6 +467,7 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                             upload = decoration_upload(xp or columns*8, yp or rows*16,
                                                        columns, rows, animate=False)
                             clear_pulse()
+                            logo.invalidate()
                             write_all(master, b'\x0c')  # fzf redraw-screen
                             heading_dirty = True
                             pulse_needs_draw = True
@@ -495,6 +502,7 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                         decoration.key = None
                         upload = decoration_upload(xp or columns*8,yp or rows*16,columns,rows,animate=False) or upload
                         clear_pulse()
+                        logo.invalidate()
                         pulse_needs_draw = True
                     ready_to_place = True
                     last_output = time.monotonic()
@@ -523,7 +531,11 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
                 if not help_visible and boundary.safe and not ready_to_place and not upload:
                     if heading_dirty:
                         if not sixel:
-                            emit(top_banner_packet(columns, rows, heading_version))
+                            # No duplicate help hint above the logo; fzf shows it below.
+                            if graphics:
+                                emit(logo.packet(columns, rows,
+                                    pixel_width=xp or columns * 8,
+                                    pixel_height=yp or rows * 16))
                         heading_dirty = False
                     location = (columns, rows, xp, yp)
                     if location != pulse_geometry:
@@ -569,7 +581,7 @@ def run_picker(argv: Sequence[str], *, input: str, env: Mapping[str, str],
             signal.signal(signum, signal.SIG_IGN)
         try:
             try:
-                cleanup = clear_pulse() + (decoration.delete() if graphics else '')
+                cleanup = clear_pulse() + (logo.clear() if graphics else '') + (decoration.delete() if graphics else '')
                 restore_terminal(terminal, original, cleanup if screen_entered else '')
             finally:
                 # These operations can raise or wait; the keyboard is already restored.

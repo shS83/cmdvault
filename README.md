@@ -1,37 +1,32 @@
-# cmdvault: approved E2EE transport (phase 1)
+# CmdVault gold logo in the Kitty picker
 
-This is deliberately **not** a finished cross-device history merge.
+Adds the repository's existing transparent `cmdvault.png` as a static header graphic **inside the animated neon tube** and above the fzf search/results area. The neon animation stays intact.
 
-Files added:
-- `src/sync/two_way.py`: explicit Push/Pull, persistent encrypted request staging, server revision tracking, transactional cursor, quarantined decrypted inbox.
-- `tests/test_two_way.py`: network-response-loss idempotency, two-device encrypted transfer, and rejection of unapproved local records.
-- `scripts/sync-approved.py`: opt-in client for an **existing** sync SQLite sidecar, not run by picker/CLI by default.
+## Install the source change
 
-## Test
+From your local checkout, with the existing `cmdvault.png` in its root:
 
-From repository root:
-
-```sh
-PYTHONPATH="$PWD" uv run --extra graphics python -m unittest discover -s tests -p test_two_way.py -v
+```bash
+cd ~/Code/cmdvault
+python /path/to/add_cmdvault_logo.py --project . --dry-run
+python /path/to/add_cmdvault_logo.py --project .
+./install.sh
 ```
 
-## Optional controlled transfer
+You may place `add_cmdvault_logo.py` in the repository directory and run `python add_cmdvault_logo.py` directly instead. The script is idempotent and checks all expected code anchors, then validates Python syntax before modifying any file. It makes `.bak` backups of changed files. Check `git diff` afterward.
 
-Use only after backing up the database and confirming credentials/key and the contents of the eligible queue. Do not test initially against irreplaceable live history.
+## Behavior
 
-```sh
-PYTHONPATH="$PWD" uv run --extra graphics python scripts/sync-approved.py --db /path/to/favorites.sync.sqlite3 --pull-only
-```
+- Displays the already-existing `cmdvault.png` (preserves the PNG alpha channel).
+- Centers it under the animated top neon border in a six-row header margin.
+- Reserves the top margin for fzf so the image cannot overlap the result list.
+- Repaints the logo on resize/redraw and removes its Kitty image on exit.
+- Only enables the image with Kitty graphics and sufficiently large terminals (at least 56 columns and 24 rows).
+- For small terminals, ANSI or SIXEL rendering, the old layout is retained.
+- Installs the PNG into `~/.local/share/cmdvault/app/cmdvault.png` via `install.sh`.
 
-Without `--pull-only`, the command sends *only* local records explicitly marked `sync_eligible`. It does not import Bash history or change favorites.json. Server records are decrypted and held in `cv_remote_inbox` pending reviewed merge. The `key.json` and `device.json` are never printed or uploaded.
+## Notes
 
-## Known limits
+The only UI change is the new static logo. All fzf operations, keyboard shortcuts, syncing, sync pulse and animated neon frame remain in their existing modules. Installed `cmdvault` uses the source file only after reinstalling with `./install.sh`.
 
-- Full bidirectional **visible** history is not yet implemented: remote records are quarantined in an inbox until deduplication, conflict handling, tag/favorite/priority merge and user review are implemented.
-- No automatic startup sync, Ctrl-R wiring or background task.
-- No history mass import; nothing becomes eligible automatically.
-- No conflict auto-merge: in-flight changes with a changed remote revision halt rather than overwriting.
-- Server's preexisting synthetic probe is recognized but not imported into history.
-- The outgoing ciphertext is persisted in `cv_sync_requests` (a private SQLite file) so an HTTP timeout can safely retry the *same* mutation.
-- `cv_remote_inbox` contains locally decrypted commands; protect the sidecar with filesystem permissions and encrypted backups.
-- Do not run parallel sync processes on one sidecar yet; multi-process locking still needs implementation.
+To undo, restore `*.bak` for the four edited files and rerun `./install.sh`.

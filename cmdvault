@@ -445,15 +445,19 @@ def pick_loop(entries, query, favorites_only, enter_action, history_path, positi
 	if fallback_notice:
 		print("cmdvault: " + fallback_notice, file=sys.stderr)
 	neon_picker = backend == "kitty" and sys.stdin.isatty()
+	dimensions = shutil.get_terminal_size((80, 24))
 	if neon_picker:
-		dimensions = shutil.get_terminal_size((80, 24))
 		neon_picker = dimensions.columns >= 32 and dimensions.lines >= 10
+	# Leave the top six rows to the Kitty image; fzf must not draw into them.
+	logo_header_rows = (6 if neon_picker and dimensions.columns >= 56
+		and dimensions.lines >= 24
+		and (Path(__file__).resolve().parent / "cmdvault.png").is_file() else 1)
 	terminal_picker = sys.stdin.isatty() and backend in ("ansi", "kitty", "sixel")
 	def invoke(argv, **kwargs):
 		if terminal_picker:
 			removed = ("--height=", "--border=", "--border-label=") if neon_picker or backend == "sixel" else ("--height=",)
 			argv = [arg for arg in argv if not arg.startswith(removed)]
-			argv += ["--no-clear", "--height=100%", ("--margin=1,2,0,2" if backend == "sixel" else "--margin=1,0,0,0")]
+			argv += ["--no-clear", "--height=100%", ("--margin=1,2,0,2" if backend == "sixel" else f"--margin={logo_header_rows},0,0,0")]
 			if neon_picker or backend == "sixel":
 				argv += ["--border=none"]
 			return run_picker(argv, input=kwargs["input"], env=kwargs["env"], config=_VISUAL_CONFIG, graphics=neon_picker, sixel=backend == "sixel")
